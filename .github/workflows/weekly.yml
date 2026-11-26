@@ -1,0 +1,30 @@
+# Weekly advisory scan of every lockfile (dependencies.json > audit_cadence > weekly).
+name: weekly
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'     # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  osv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install osv-scanner 2.7.1 (same pin and hash as dev/Containerfile)
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/osv-scanner" https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64
+          echo "fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/osv-scanner"
+
+      - name: Scan Cargo.lock, fuzz/Cargo.lock and services/go.mod
+        run: '"$RUNNER_TEMP/osv-scanner" scan source -r .'

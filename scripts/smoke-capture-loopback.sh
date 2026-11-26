@@ -17,14 +17,14 @@ fi
 run() { # run <user> <extra podman args...> -- <bash script>
   local user="$1"; shift
   local args=(); while [ "$1" != "--" ]; do args+=("$1"); shift; done; shift
-  timeout 60 podman run --rm --userns=keep-id --user "$user" \
+  timeout 60 podman run --rm --userns=keep-id:uid=1000,gid=1000 --user "$user" \
     --security-opt no-new-privileges --cap-drop=all "${args[@]}" \
     -v "$root:/work:Z" "$tag" bash -c "$1"
 }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 bin="./${SMOKE_BIN:-target/debug/silentsnake-capture}"
 [ -x "$root/${bin#./}" ] || fail "binary not found: $bin"
-me="$(id -u):$(id -g)"
+me="1000:1000"   # the host user, mapped to the image's unprivileged uid 1000
 
 # 1. Unprivileged user + CAP_NET_RAW only: live loopback capture works.
 out="$(run "$me" --cap-add=NET_RAW -- "
@@ -32,7 +32,7 @@ out="$(run "$me" --cap-add=NET_RAW -- "
     (exec 3<>/dev/tcp/127.0.0.1/1) 2>/dev/null; true ) &
   timeout -s KILL 15 $bin -i lo --duration 3 --stats 1")"
 n=$(grep -c . <<<"$out")
-head -n1 <<<"$out" | grep -q "\"type\":\"engine_start\".*\"euid\":$(id -u),\"cap_net_raw\":true" || fail "engine_start does not show a non-root euid with CAP_NET_RAW"
+head -n1 <<<"$out" | grep -q "\"type\":\"engine_start\".*\"euid\":1000,\"cap_net_raw\":true" || fail "engine_start does not show a non-root euid with CAP_NET_RAW"
 grep -q '"type":"flow_start".*"proto":"udp","direction":"local".*"responder":{"ip":"127.0.0.1","port":9}' <<<"$out" || fail "no local UDP flow to 127.0.0.1:9"
 grep -q '"type":"flow_end".*"proto":"tcp".*"reason":"reset"' <<<"$out" || fail "no reset TCP flow to 127.0.0.1:1"
 grep -q '"type":"stats"' <<<"$out" || fail "no stats event"

@@ -1,0 +1,46 @@
+# Merge gates on every push to main and every pull request (CLAUDE.md section 4; closes ADV-0012).
+# Everything runs in the pinned containers through the same scripts used locally.
+# Third-party actions are pinned by full commit SHA (approved by Ronin, 2026-11-25).
+name: gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0            # gitleaks scans the full history
+          persist-credentials: false
+
+      - name: Runner environment
+        run: |
+          podman --version
+          uname -r
+
+      - name: Build pinned dev container
+        run: scripts/dev.sh true
+
+      - name: Gates (fmt, clippy, tests, deny, audit, osv-scanner, gitleaks)
+        run: scripts/gates.sh
+
+      - name: Smoke test (non-root + CAP_NET_RAW loopback capture)
+        run: scripts/smoke-capture-loopback.sh
+
+      - name: Fuzz smoke (30 s per target)
+        run: |
+          for t in dns tls decode engine; do scripts/fuzz.sh "$t" 30; done
+          test -z "$(find fuzz/artifacts -type f 2>/dev/null)" || { echo "fuzzer found crashes:"; find fuzz/artifacts -type f; exit 1; }

@@ -11,7 +11,7 @@ if ! podman image exists "$tag"; then
 fi
 tty=(); [ -t 0 ] && tty=(-it)
 exec podman run --rm "${tty[@]}" \
-  --userns=keep-id --user "$(id -u):$(id -g)" \
+  --userns=keep-id:uid=1000,gid=1000 --user 1000:1000 \
   --security-opt no-new-privileges --cap-drop=all \
   -v "$root:/work:Z" \
   -v silentsnake-cargo-cache:/home/dev/.cargo-cache \

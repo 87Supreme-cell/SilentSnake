@@ -37,16 +37,7 @@ out="dist/$name"
 echo "commit $commit, version $version, target $target"
 
 step "2. Gates (dev container)"
-scripts/dev.sh bash -c '
-  set -euo pipefail
-  cargo fmt --all --check
-  cargo clippy --workspace --all-targets --locked -q -- -D warnings
-  cargo test --workspace --locked -q 2>&1 | grep -E "test result"
-  cargo deny check 2>&1 | tail -1
-  cargo audit -q
-  osv-scanner scan source -r . >/dev/null
-  gitleaks git --no-banner --redact --log-level=warn .
-' || die "gates failed"
+scripts/gates.sh || die "gates failed"
 
 step "3. Reproducible build x2 ($target)"
 tag="silentsnake-build-$target:$(sha256sum "$cf" | cut -c1-12)"
@@ -54,7 +45,7 @@ podman image exists "$tag" || podman build --pull=missing -t "$tag" -f "$cf" "re
 cache="silentsnake-build-$target-cargo"
 build_run() { # build_run <default|none> <script>
   local net=(); [ "$1" = none ] && net=(--network=none)
-  podman run --rm --userns=keep-id --user "$(id -u):$(id -g)" \
+  podman run --rm --userns=keep-id:uid=1000,gid=1000 --user 1000:1000 \
     --security-opt no-new-privileges --cap-drop=all "${net[@]}" \
     -e SOURCE_DATE_EPOCH="$epoch" -e CARGO_TARGET_DIR=/tmp/target \
     -e RUSTFLAGS="--remap-path-prefix=/home/builder/.cargo-cache=/cargo --remap-path-prefix=/work=/src" \
