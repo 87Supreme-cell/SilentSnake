@@ -14,6 +14,11 @@ exec "$root/scripts/dev.sh" bash -c '
   step "cargo-deny";     cargo deny check
   step "cargo-audit";    cargo audit
   step "fuzz workspace"; (cd fuzz && cargo deny check && cargo audit)
+  step "gofmt";          (cd services && test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; })
+  step "go vet";         (cd services && go vet ./...)
+  step "go test -race";  (cd services && go test -race -count=1 ./...)
+  step "go fuzz (10 s)"; (cd services && go test -run=^$ -fuzz=FuzzQueryValidation -fuzztime=10s ./api)
+  step "govulncheck";    (cd services && govulncheck ./...)
   step "osv-scanner";    osv-scanner scan source -r .
   step "gitleaks (full history)"; gitleaks git --no-banner --redact --log-level=warn .
   step "gitleaks (working tree)"; gitleaks dir --no-banner --redact --log-level=warn .
