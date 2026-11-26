@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SilentSnake commit gate: blocks secrets and key material from entering git.
+# Enable once per clone:  git config core.hooksPath scripts/hooks
+# Fails closed: if gitleaks is missing, the commit is refused.
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not installed; refusing commit (see docs/security/secrets.md)" >&2
+  exit 1
+fi
+
+# 1. Block key-like files by name, even if someone force-adds them past .gitignore.
+blocked='(\.pem|\.key|\.p12|\.pfx|\.jks|\.kdbx|\.sealed|\.env(\..*)?|credentials.*|\.netrc|id_(rsa|ecdsa|ed25519)[^/]*)$'
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$blocked" | grep -v '\.pub$' || true)
+if [ -n "$bad" ]; then
+  echo "pre-commit: key-like files staged; refusing commit:" >&2
+  echo "$bad" >&2
+  exit 1
+fi
+
+# 2. Block private key blocks by content.
+if git diff --cached -U0 | grep -qE -- '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'; then
+  echo "pre-commit: private key material in staged changes; refusing commit" >&2
+  exit 1
+fi
+
+# 3. Full gitleaks scan of staged changes, with findings redacted in output.
+gitleaks git --staged --redact --no-banner --config .gitleaks.toml

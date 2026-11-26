@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/capture", "crates/logstore", "crates/ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99.0"
+publish = false
+
+# Exact pins approved 2026-11-25. A crate is attached to a member only when its
+# component or capture stage starts; Cargo.lock then records its hash.
+[workspace.dependencies]
+pcap = "=2.5.0"
+etherparse = "=0.21.1"          # 0.21.1 fixes RUSTSEC-2026-0596 (approved exception to the 2-week rule)
+aya = "=0.16.0"                 # stage C
+rustls = { version = "=0.23.46", default-features = false }
+aws-lc-rs = "=1.19.0"
+rusqlite = "=0.42.0"
+zeroize = "=1.9.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"          # the ffi crate opts out with its own lints table
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = true

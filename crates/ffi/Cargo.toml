@@ -1,0 +1,17 @@
+[package]
+name = "silentsnake-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The only crate where unsafe is allowed (CLAUDE.md section 4). Every unsafe block needs review.
+[lints.rust]
+unsafe_code = "deny"            # each use must be explicitly allowed with #[allow(unsafe_code)] and a SAFETY comment
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]

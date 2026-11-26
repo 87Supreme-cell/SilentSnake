@@ -1,0 +1,72 @@
+# SilentSnake dev container. Every toolchain and tool is pinned by version and SHA-256.
+# Approved pins (Ronin, 2026-11-25). Changing any value here is a dependency update:
+# explicit approval, one PR per update, audit gates re-run (dependencies.json version_policy).
+FROM registry.fedoraproject.org/fedora:45@sha256:92837d4834c1cff45cc2d534b655489b8e536271de1897932117e396cc9980c5
+
+# System packages. Fedora cannot pin exact RPM versions reproducibly (mirrors drop
+# superseded updates); the installed set is recorded at /etc/silentsnake-rpm.lock.
+RUN dnf -y install --setopt=install_weak_deps=False \
+      gcc gcc-c++ make cmake perl-core pkgconf-pkg-config \
+      libpcap-devel openssl-devel \
+      git-core tcpdump wireshark-cli asciinema \
+      xz tar gzip which findutils procps-ng binutils \
+ && dnf clean all \
+ && rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /etc/silentsnake-rpm.lock
+
+ARG TOOLS=/opt/tools/bin
+ENV PATH=/opt/cargo/bin:/usr/local/go/bin:/opt/go/bin:/opt/tools/bin:$PATH \
+    RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
+    GOPATH=/opt/go GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+    GOSUMDB=sum.golang.org GOPROXY=https://proxy.golang.org
+
+# Go 1.27.4
+RUN curl -fsSLo /tmp/go.tgz https://go.dev/dl/go1.27.4.linux-amd64.tar.gz \
+ && echo "7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840  /tmp/go.tgz" | sha256sum -c - \
+ && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+
+# Rust 1.99.0 via rustup 1.29.3 (rustup verifies toolchain hashes from the signed channel manifest)
+RUN curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init \
+ && echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c - \
+ && chmod +x /tmp/rustup-init \
+ && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.99.0 -c clippy,rustfmt \
+ && rm /tmp/rustup-init
+
+# Security tooling: release binaries, SHA-256 cross-checked against each project's checksums file.
+RUN mkdir -p $TOOLS && cd /tmp \
+ && curl -fsSLo gl.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+ && echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gl.tgz" | sha256sum -c - \
+ && tar -xzf gl.tgz -C $TOOLS gitleaks \
+ && curl -fsSLo syft.tgz https://github.com/anchore/syft/releases/download/v1.57.1/syft_1.57.1_linux_amd64.tar.gz \
+ && echo "bf52519eb57f675d47c07d43213cb6dff6449f3d6d1147ff6701ed91f44eef0c  syft.tgz" | sha256sum -c - \
+ && tar -xzf syft.tgz -C $TOOLS syft \
+ && curl -fsSLo $TOOLS/cosign https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64 \
+ && echo "424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa  $TOOLS/cosign" | sha256sum -c - \
+ && curl -fsSLo $TOOLS/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64 \
+ && echo "fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  $TOOLS/osv-scanner" | sha256sum -c - \
+ && curl -fsSLo gosec.tgz https://github.com/securego/gosec/releases/download/v2.30.0/gosec_2.30.0_linux_amd64.tar.gz \
+ && echo "3fcce2c4e802ff4169217874602a7df355e9a37bcb6ffaa34b08f3d5f336cdfb  gosec.tgz" | sha256sum -c - \
+ && tar -xzf gosec.tgz -C $TOOLS gosec \
+ && curl -fsSLo sc.tgz https://github.com/dominikh/go-tools/releases/download/2026.2.2/staticcheck_linux_amd64.tar.gz \
+ && echo "14c081e0f0d05b5a4d4c53fd3d357d4a5af9d20501465fefc9024ee828d3aa5c  sc.tgz" | sha256sum -c - \
+ && tar -xzf sc.tgz -C /tmp && mv /tmp/staticcheck/staticcheck $TOOLS/ \
+ && chmod 0755 $TOOLS/* && rm -rf /tmp/*
+
+# govulncheck (no release binaries): module hashes verified by GOSUMDB
+RUN GOFLAGS=-mod=mod go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+# Cargo security tools, built from crates.io with their own lockfiles
+RUN cargo install --locked cargo-audit@0.23.0 cargo-deny@0.20.2 cargo-fuzz@0.13.2 \
+ && rm -rf /opt/cargo/registry/cache /opt/cargo/registry/src
+
+# cargo-geiger: its bundled curl does not build against Fedora 45 OpenSSL, so link the
+# distro libcurl instead (curl-sys uses it when pkg-config finds it).
+RUN dnf -y install --setopt=install_weak_deps=False libcurl-devel && dnf clean all \
+ && rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /etc/silentsnake-rpm.lock \
+ && cargo install --locked cargo-geiger@0.14.0 \
+ && rm -rf /opt/cargo/registry/cache /opt/cargo/registry/src
+
+# Unprivileged user; the repo is mounted at /work. Toolchain dirs stay root-owned.
+RUN useradd -m -u 1000 dev && mkdir -p /work && chown dev:dev /work
+USER dev
+ENV CARGO_HOME=/home/dev/.cargo-cache CARGO_INSTALL_ROOT=/opt/cargo GOPATH=/home/dev/go GOMODCACHE=/home/dev/go/pkg/mod
+WORKDIR /work

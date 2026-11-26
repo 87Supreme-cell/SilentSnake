@@ -1,0 +1,90 @@
+{
+  "project": "SilentSnake",
+  "license": "MIT",
+  "purpose_of_file": "Instructions for Claude Code: what to build with, in what order, and what security gates every change must pass.",
+  "version_policy": {
+    "rule": "Every version below marked PIN_AT_INIT must be resolved to an exact version and hash at project init, then locked (Cargo.lock, go.sum, pubspec.lock). No ranges, no 'latest'.",
+    "updates": "Dependency updates only by explicit user approval, one PR per update, with audit gates re-run."
+  },
+  "build_order": [
+    { "phase": 1, "name": "backend", "owner": "claude_code", "scope": ["capture_engine (rust)", "log_store (rust)", "local_rest_api (go)", "llm_sandbox (go)"] },
+    { "phase": 2, "name": "frontend", "owner": "ronin", "scope": ["dashboard", "risk_meter", "live_log_iframe", "widget"], "rule": "Claude Code does not design or build the frontend unless Ronin explicitly asks. Backend exposes a stable, documented API for it." }
+  ],
+  "toolchains": {
+    "rust": { "version": "PIN_AT_INIT (stable)", "pin_file": "rust-toolchain.toml" },
+    "go": { "version": "PIN_AT_INIT", "pin_file": "go.mod toolchain directive" },
+    "dart_flutter": { "version": "PIN_AT_INIT", "pin_file": ".fvmrc or pubspec environment constraint" }
+  },
+  "runtime_dependencies": {
+    "rust": [
+      { "name": "pcap", "use": "libpcap bindings for packet capture", "version": "PIN_AT_INIT" },
+      { "name": "etherparse", "use": "packet parsing", "version": "PIN_AT_INIT" },
+      { "name": "aya", "use": "eBPF programs for per-process attribution", "version": "PIN_AT_INIT" },
+      { "name": "rustls", "use": "TLS; use a FIPS-capable crypto provider", "version": "PIN_AT_INIT" },
+      { "name": "aws-lc-rs", "use": "crypto provider with a FIPS 140-3 validated mode", "version": "PIN_AT_INIT" },
+      { "name": "rusqlite", "use": "local log store", "version": "PIN_AT_INIT" },
+      { "name": "zeroize", "use": "wipe secrets from memory after use", "version": "PIN_AT_INIT" },
+      { "name": "serde / serde_json", "use": "structured logs and export", "version": "PIN_AT_INIT" }
+    ],
+    "go": [
+      { "name": "standard library net/http", "use": "local REST API bound to 127.0.0.1 only" },
+      { "name": "Go native FIPS 140-3 module (GOFIPS140)", "use": "FIPS mode toggle by config" }
+    ],
+    "dart": [
+      { "name": "flutter", "use": "GUI and widget (phase 2, Ronin-led)", "version": "PIN_AT_INIT" }
+    ],
+    "system": [
+      { "name": "libpcap", "use": "capture library under tcpdump and tshark" },
+      { "name": "tcpdump", "use": "capture backend, phase B integration" },
+      { "name": "tshark (Wireshark CLI)", "use": "protocol dissection backend, phase B integration" }
+    ]
+  },
+  "security_tooling": {
+    "dependency_audit": ["cargo-audit", "cargo-deny (licenses, bans, advisories, sources)", "govulncheck", "osv-scanner", "dart pub outdated + osv-scanner on pubspec.lock"],
+    "sbom": { "tool": "syft", "formats": ["spdx-json", "cyclonedx-json"], "when": "every release build" },
+    "signing": { "commits": "signed (SSH or GPG)", "releases": "cosign (Sigstore) signatures + checksums", "provenance": "SLSA build provenance attestation" },
+    "secrets_scan": ["gitleaks"],
+    "static_analysis": ["cargo clippy -D warnings", "go vet", "staticcheck", "gosec", "dart analyze"],
+    "memory_safety": ["cargo miri on unsafe code", "cargo-geiger to count unsafe", "AddressSanitizer / LeakSanitizer on FFI paths", "go test -race"],
+    "fuzzing": ["cargo-fuzz on packet parsers", "go test -fuzz on API input handlers"]
+  },
+  "threat_model": [
+    { "threat": "memory leakage / disclosure", "mitigations": ["Rust for all packet parsing", "forbid unsafe outside a reviewed FFI module", "zeroize secrets", "sanitizer runs in CI", "fuzz parsers"] },
+    { "threat": "dependency signature corruption / tampering", "mitigations": ["lockfiles with hashes", "cargo-deny source allowlist", "go.sum verified via GOSUMDB", "vendor dependencies for offline reproducible builds", "verify signatures before build", "SBOM diff on every change"] },
+    { "threat": "malicious or typosquatted package", "mitigations": ["allowlist of crates/modules", "no new dependency without user approval", "osv-scanner gate"] },
+    { "threat": "privilege escalation", "mitigations": ["never run as root", "capture via CAP_NET_RAW/CAP_BPF on capture binary only", "systemd sandboxing (ProtectSystem, NoNewPrivileges)"] },
+    { "threat": "data exfiltration via LLM", "mitigations": ["LLM read-only access to log files", "local model preferred", "commercial API off by default, redacted summaries only, user opt-in", "egress firewall rule for sandbox"] },
+    { "threat": "local API abuse", "mitigations": ["bind 127.0.0.1 only", "token auth", "strict input validation", "rate limit"] },
+    { "threat": "log tampering", "mitigations": ["append-only logs", "hash-chained entries", "signed exports"] }
+  ],
+  "smoke_tests": {
+    "rule": "Run on every build. Any failure blocks merge.",
+    "tests": [
+      "binaries build reproducibly (two builds, identical hashes)",
+      "all audit tools report zero unresolved high/critical issues",
+      "SBOM generated and matches lockfiles",
+      "capture engine starts without root and captures loopback traffic",
+      "REST API refuses connections from non-127.0.0.1 addresses",
+      "LLM sandbox cannot open network sockets or write files",
+      "FIPS mode toggle works from config alone",
+      "log export round-trips and its signature verifies"
+    ]
+  },
+  "audit_cadence": {
+    "per_commit": ["smoke_tests", "static_analysis", "secrets_scan"],
+    "per_release": ["full dependency audit", "sbom", "signing", "fuzzing run", "memory_safety"],
+    "weekly": ["osv-scanner against lockfiles for new advisories"]
+  },
+  "capture_integration_roadmap": [
+    { "stage": "A", "goal": "native capture", "work": "Rust engine on libpcap; flows, DNS, TLS SNI; plain-English summaries" },
+    { "stage": "B", "goal": "wire existing tools underneath", "work": "adapters that run tcpdump and tshark as unprivileged subprocesses and parse their output (tshark -T json/ek); same log schema" },
+    { "stage": "C", "goal": "process attribution", "work": "eBPF via aya to tag each flow with its process and systemd unit; evaluate ptcpdump" },
+    { "stage": "D", "goal": "deep inspection of the user's own HTTPS", "work": "optional mitmproxy integration, user-installed CA, off by default, clear warnings" },
+    { "stage": "E", "goal": "network-level analytics", "work": "optional Zeek integration for richer protocol logs" }
+  ],
+  "frameworks": {
+    "controls": "NIST SP 800-53",
+    "secure_development": "NIST SSDF (SP 800-218)",
+    "crypto": "FIPS 140-3 validated modes, configurable"
+  }
+}

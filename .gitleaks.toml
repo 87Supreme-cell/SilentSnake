@@ -1,0 +1,18 @@
+# gitleaks config for SilentSnake. Default rules plus project-specific ones.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "silentsnake-api-token"
+description = "SilentSnake local API token"
+regex = '''(?i)silentsnake[_-]?(api[_-]?)?token\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}'''
+
+[[rules]]
+id = "private-key-block"
+description = "Any PEM private key block"
+regex = '''-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'''
+
+[[rules]]
+id = "raw-key-hex"
+description = "Hex-encoded 256-bit value assigned to a key/secret/seed name"
+regex = '''(?i)(key|secret|seed|nonce)\w*\s*[:=]\s*['"]?[0-9a-f]{64}\b'''

@@ -1,0 +1,39 @@
+# Third-party reference images: never commit (CLAUDE.md section 6)
+/ui-references/
+
+# Build output
+/target/
+**/bin/
+**/build/
+.dart_tool/
+
+# Secrets and key material
+*.pem
+*.key
+*.p12
+.env
+.env.*
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Runtime data and crash dumps
+core
+core.*
+*.dump
+
+# More key-like files (convenience only; real enforcement is scripts/hooks/pre-commit
+# and the adversary secret hunt, see docs/security/secrets.md)
+*.pfx
+*.jks
+*.kdbx
+*.sealed
+id_rsa*
+id_ecdsa*
+id_ed25519*
+!*.pub
+credentials*
+.netrc
+
+# Session checkpoint (local only)
+/CHECKPOINT.md

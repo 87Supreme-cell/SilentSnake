@@ -1,0 +1,180 @@
+# SilentSnake - project configuration / spec
+# License: MIT
+project:
+  name: SilentSnake
+  version: 0.1.0
+  license: MIT
+  platform: linux
+  purpose: >
+    Linux tool that monitors inbound and outbound traffic and connectivity,
+    shown as a GUI and desktop widget, with detailed logs for audit and export.
+
+languages:            # dependencies / implementation languages
+  - rust              # capture engine, core, crypto
+  - go                # services, local REST API
+  - dart              # GUI and widget (Flutter)
+
+features:
+  monitoring:
+    directions: [inbound, outbound]
+    targets: [processes, web_sessions, systemd_daemons]
+    deep_scan:
+      user_controlled: true        # start/stop by the user only
+      scopes: [process, web_session, daemon]
+  dashboard:
+    realtime: true
+    risk_meter:
+      enabled: true
+      color_scale: [green, yellow, orange, red]   # correlated to risk score
+    live_log_panel:
+      enabled: true
+      embed: iframe
+  widget:
+    enabled: true
+  logging:
+    detail_level: verbose
+    audit_trail: true
+    export_formats: [json, csv]
+    storage: local_only
+
+permissions:
+  authority: user               # permissions are set by the user
+  llm_can_change_permissions: false
+  require_user_confirmation_for: [deep_scan_start, deep_scan_stop, export, config_change]
+
+llm:
+  role: analysis_and_questions_only
+  sandbox:
+    location: local_machine
+    access:
+      read: [log_files]
+      write: []
+      execute: []
+    egress_of_logs: false        # logs never leave the machine
+  providers:
+    preferred: local
+    local:
+      enabled: true
+      interface: rest_api
+      bind_address: 127.0.0.1
+      port: 8765
+    commercial:
+      enabled: false             # off by default; user must opt in
+      interface: api_endpoint
+      endpoint: ""               # set by user
+      # NOTE: sending a question to a commercial API is egress.
+      # Decide what may be sent (e.g. redacted summaries only) before enabling.
+      allowed_payload: redacted_summary
+
+compliance:
+  frameworks:
+    controls: "NIST SP 800-53"
+    secure_development: "NIST SSDF (SP 800-218)"
+  supply_chain:
+    pin_all_dependencies: true
+    sbom:
+      generate: true
+      tool: syft
+      formats: [spdx-json, cyclonedx-json]
+    signed_commits: true
+    signed_releases: true
+    reproducible_builds: true
+  crypto:
+    require_fips_140_3_validated_modes: true
+    fips_mode: configurable       # toggled by config, not code changes
+
+environments:
+  phase_1:
+    name: civilian_local
+    military_content: none
+  phase_2:
+    name: gfe_provisioned
+    config_source: separate_override_file   # supplied at handoff
+
+
+design:                          # frontend is Ronin-led; these are the agreed design factors
+  owner: ronin
+  framework: flutter (dart)
+  reference_folder: ui-references/          # internal reference only - do NOT commit images to the MIT repo
+  reference_index: ui-references/INDEX.md
+
+  style:
+    primary_reference: ui-references/ronin-style-reference.jpg
+    theme: dark
+    surfaces: glassy gradient cards, rounded corners, soft glow accents
+    layout: left icon sidebar + responsive card grid
+    typography: large numeric hero values, small muted labels
+
+  screens:
+    dashboard:
+      purpose: real-time overview on one screen
+      references:
+        - ui-references/ronin-style-reference.jpg     # card grid and visual style
+        - ui-references/01-sniffnet-overview.png      # in/out traffic chart + ranked host/service/program lists
+        - ui-references/07-ntopng-dashboard.png       # always-visible status strip with count badges
+      cards:
+        risk_meter:
+          form: gradient ring (the "productivity" ring in the style reference)
+          shows: numeric score + severity label + color, never color alone
+          references:
+            - ui-references/08-ntopng-live-flows-score.png
+            - ui-references/12-ntopng-nanalyst-policy-scores.png
+        traffic_activity:
+          form: bar chart (the "weekly activity" card), by hour or by process
+          references: [ui-references/01-sniffnet-overview.png]
+        live_connections:
+          form: list card (the "tasks" card) with status column allowed | flagged | blocked
+          references:
+            - ui-references/02-sniffnet-inspect-filters.png
+            - ui-references/08-ntopng-live-flows-score.png
+        process_bandwidth:
+          form: horizontal bars (the "system status" card) per process, plus capture engine health
+          references: [ui-references/17-bandwhich-per-process-tui.gif]
+        deep_scan_control:
+          form: timer card (the "focus timer") with start/stop and elapsed time
+          user_confirmation_required: true
+        alerts:
+          form: expandable event cards, each with a plain-English explanation beside it
+          references:
+            - ui-references/03-sniffnet-notifications.png
+            - ui-references/13-securityonion-alerts-with-summary.png
+    live_log:
+      embed: iframe panel
+      features: [typed/colored rows (dns, http, tls), timeline histogram, filters, pause]
+      references:
+        - ui-references/04-opensnitch-prompt-and-live-log.png
+        - ui-references/06-opensnitch-filtered-log.png
+        - ui-references/16-zui-typed-log-timeline.gif
+    process_and_daemon_view:
+      shows: binary path, command-line args, PID/UID, systemd unit, every destination, hit counts
+      references:
+        - ui-references/05-opensnitch-per-process.png
+        - ui-references/17-bandwhich-per-process-tui.gif
+    deep_scan_results:
+      shows: per-session packet detail, protocol flags as tags, signed export
+      references:
+        - ui-references/15-securityonion-pcap-view.png
+        - ui-references/16-zui-typed-log-timeline.gif
+    llm_analysis_panel:
+      layout: chat center, evidence panel right listing every tool call the model made, model picker, disclaimer
+      rules: read-only on log files; every AI action written to the audit log
+      references:
+        - ui-references/09-ntopng-nanalyst-chat.png
+        - ui-references/10-ntopng-nanalyst-evidence-panel.png
+    audit_and_export:
+      shows: timestamp, user, triggered_by (user | llm), action, content; export json/csv, signed
+      references: [ui-references/11-ntopng-nanalyst-audit-log.png]
+    settings:
+      features: [simple/advanced toggle, permission controls owned by user]
+      references: [ui-references/18-portmaster-settings.png]
+    widget:
+      form: small standalone cards from the dashboard (risk ring, live bandwidth, active alerts)
+      references: [ui-references/ronin-style-reference.jpg]
+      note: no open-source monitor ships a desktop widget; this is original ground
+
+  color_and_accessibility:
+    risk_scale: [green, yellow, orange, red]
+    direction_encoding: shape or arrow icon, not color, so it does not clash with the risk scale
+    status_colors: high contrast against dark gradients
+    never_color_alone: true        # always pair with icon, label or number
+    contrast_target: WCAG 2.2 AA
