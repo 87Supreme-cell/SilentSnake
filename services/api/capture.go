@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,12 +12,17 @@ import (
 	"time"
 )
 
-// maxLine bounds one capture event line; longer lines are rejected, not buffered.
+// maxLine bounds one capture event line; longer lines are discarded and counted.
 const maxLine = 1 << 20
 
-// Supervisor runs the capture engine as a child process (it holds CAP_NET_RAW itself; this
-// service holds no capabilities) and feeds its stdout into State and the Hub. If the engine
-// exits, it is restarted with backoff and the failure is visible in /v1/overview.
+// staleAfter: the engine runs with --stats 1, so silence this long means it is stuck
+// (stopped, wedged, or blocked) and is killed and restarted (ADV-0039). A variable for tests.
+var staleAfter = 5 * time.Second
+
+// Supervisor runs the capture engine as a child process and feeds its stdout into State and
+// the Hub. The API holds no capabilities (ADV-0035): the engine gets CAP_NET_RAW from its own
+// file capability. If the engine exits or goes silent, it is restarted with backoff and the
+// failure is visible in /v1/overview.
 type Supervisor struct {
 	Bin       string
 	Interface string
@@ -50,8 +56,15 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
+var errStale = errors.New("no events from the capture engine for 5 s (stalled); restarting it")
+
 func (s *Supervisor) runOnce(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, s.Bin, "-i", s.Interface, "--stats", "1")
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// #nosec G204 -- the binary path is the user's own --capture-bin, checked by
+	// checkExecutable; arguments are fixed apart from the validated interface name.
+	cmd := exec.CommandContext(runCtx, s.Bin, "-i", s.Interface, "--stats", "1")
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"} // minimal environment (ADV-0043)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -61,26 +74,71 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("cannot start capture engine %q: %w", s.Bin, err)
 	}
-	s.consume(stdout)
+	s.State.Touch(time.Now())
+	go s.watchdog(runCtx, cancel)
+	readErr := s.consume(stdout)
+	if readErr != nil {
+		cancel(readErr)
+	}
 	err = cmd.Wait()
+	if c := context.Cause(runCtx); c != nil && !errors.Is(c, context.Canceled) {
+		return c
+	}
 	if msg := strings.TrimSpace(stderr.String()); msg != "" {
 		return fmt.Errorf("capture engine: %s", msg)
 	}
 	return err
 }
 
-func (s *Supervisor) consume(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), maxLine)
-	for sc.Scan() {
-		line := sc.Bytes()
-		ev, ts, err := parseEvent(line)
-		if err != nil {
+// watchdog kills the engine (via the run context) if it stops producing events.
+func (s *Supervisor) watchdog(ctx context.Context, cancel context.CancelCauseFunc) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			if now.Sub(s.State.LastEventAt()) > staleAfter {
+				cancel(errStale)
+				return
+			}
+		}
+	}
+}
+
+// consume reads JSON lines. A line longer than maxLine is discarded up to its newline and
+// counted as rejected; reading continues (ADV-0039).
+func (s *Supervisor) consume(r io.Reader) error {
+	br := bufio.NewReaderSize(r, maxLine)
+	for {
+		line, err := br.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
 			s.State.Rejected()
+			for errors.Is(err, bufio.ErrBufferFull) {
+				_, err = br.ReadSlice('\n')
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return err
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			continue
 		}
-		entry := s.State.Apply(ev, ts)
-		s.Hub.Publish(entry)
+		if len(line) > 0 {
+			if ev, ts, perr := parseEvent(line); perr != nil {
+				s.State.Rejected()
+			} else {
+				s.Hub.Publish(s.State.Apply(ev, ts))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +18,8 @@ const (
 	rateBurst    = 40
 	ratePerSec   = 20
 	maxListLimit = 500
+	// streamWriteTimeout: a stream client that can't take an event this fast is dropped.
+	streamWriteTimeout = 5 * time.Second
 )
 
 // Server is the local REST API (docs/api/rest-api.md): GET only, 127.0.0.1 only,
@@ -68,23 +71,25 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		h.Set("Cache-Control", "no-store")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
+		// Every rejection before authentication closes the connection, so nothing
+		// unauthenticated can hold a keep-alive slot (ADV-0037).
+		reject := func(code int, msg string) {
+			h.Set("Connection", "close")
+			fail(w, code, msg)
+		}
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() || ip.To4() == nil {
-			fail(w, http.StatusForbidden, "only 127.0.0.1 may connect")
+			reject(http.StatusForbidden, "only 127.0.0.1 may connect")
 			return
 		}
-		if !hosts[r.Host] {
-			fail(w, http.StatusForbidden, "unexpected Host header")
+		// Origin-form targets only: an absolute-form target would override Host (ADV-0044).
+		if !strings.HasPrefix(r.RequestURI, "/") || !hosts[r.Host] {
+			reject(http.StatusForbidden, "unexpected Host header or request target")
 			return
 		}
 		if r.Method != http.MethodGet {
 			h.Set("Allow", "GET")
-			fail(w, http.StatusMethodNotAllowed, "read-only API: GET only")
-			return
-		}
-		if !s.limiter.Allow() {
-			h.Set("Retry-After", "1")
-			fail(w, http.StatusTooManyRequests, "rate limit exceeded")
+			reject(http.StatusMethodNotAllowed, "read-only API: GET only")
 			return
 		}
 		const prefix = "Bearer "
@@ -92,7 +97,14 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix ||
 			subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), s.Token) != 1 {
 			h.Set("WWW-Authenticate", `Bearer realm="silentsnake"`)
-			fail(w, http.StatusUnauthorized, "missing or invalid token")
+			reject(http.StatusUnauthorized, "missing or invalid token")
+			return
+		}
+		// The rate limit applies to authenticated clients only, so unauthenticated traffic
+		// can't starve the dashboard (ADV-0036).
+		if !s.limiter.Allow() {
+			h.Set("Retry-After", "1")
+			fail(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -115,6 +127,9 @@ func query(r *http.Request, allowed ...string) (url.Values, error) {
 		}
 		if len(v) != 1 {
 			return nil, fmt.Errorf("parameter %q given more than once", k)
+		}
+		if v[0] == "" {
+			return nil, fmt.Errorf("parameter %q is empty", k)
 		}
 	}
 	return q, nil
@@ -209,11 +224,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusTooManyRequests, "too many open streams")
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		fail(w, http.StatusInternalServerError, "streaming unsupported")
-		return
-	}
+	rc := http.NewResponseController(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	sub := s.Hub.Subscribe()
@@ -228,11 +239,14 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		}
 		wmu.Lock()
 		defer wmu.Unlock()
+		// A client that stops reading loses its slot instead of holding it forever (ADV-0041).
+		if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil {
+			return false
+		}
 		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b); err != nil {
 			return false
 		}
-		fl.Flush()
-		return true
+		return rc.Flush() == nil
 	}
 	if !send("overview", s.State.Overview()) {
 		return

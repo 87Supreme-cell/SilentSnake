@@ -12,7 +12,10 @@ var errSchema = errors.New("not a silentsnake.capture/1 event")
 const (
 	maxRecentFlows  = 500
 	maxRecentEvents = 500
-	trafficMinutes  = 60
+	// Ended flagged flows pushed out of the recent ring are kept here, so churn can't evict
+	// the evidence behind the score (ADV-0038).
+	maxFlaggedKept = 200
+	trafficMinutes = 60
 	// Engine-level findings count toward the overall score for this long.
 	engineSignalTTL = 10 * time.Minute
 	// Overall risk considers flows seen within this window.
@@ -69,6 +72,8 @@ type Engine struct {
 	KernelDropped  uint64    `json:"kernel_dropped"`
 	Incomplete     bool      `json:"incomplete"`
 	LastError      string    `json:"last_error,omitempty"`
+	LastEventAt    time.Time `json:"last_event_at,omitempty"`
+	Restarts       int       `json:"restarts"`
 	EventsRejected uint64    `json:"events_rejected"`
 }
 
@@ -79,6 +84,7 @@ type State struct {
 	engine    Engine
 	active    map[uint64]*Flow
 	recent    []*Flow // ended, newest last
+	flagged   []*Flow // ended + flagged, evicted from recent; newest last
 	events    []LogEntry
 	buckets   []minuteBucket
 	lastBytes uint64
@@ -87,6 +93,8 @@ type State struct {
 	lastTrailing   uint64
 	trailingSeenAt time.Time
 	droppedSeenAt  time.Time
+	restartSeenAt  time.Time
+	lastEventAt    time.Time
 }
 
 func NewState(iface string, now func() time.Time) *State {
@@ -106,8 +114,19 @@ func (s *State) Apply(ev *CaptureEvent, ts time.Time) LogEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := LogEntry{Seq: ev.Seq, TS: ts, Type: ev.Type, Summary: ev.Summary, FlowID: ev.FlowID}
+	s.lastEventAt = s.now()
 	switch ev.Type {
 	case "engine_start":
+		if !s.engine.StartedAt.IsZero() {
+			// A restart: flows still open belonged to the old run. Keep them as evidence
+			// (they may be flagged) and make the restart itself visible (ADV-0038).
+			for _, f := range s.active {
+				f.Ended, f.EndReason = true, "engine_restart"
+				s.endFlow(f)
+			}
+			s.engine.Restarts++
+			s.restartSeenAt = s.now()
+		}
 		s.engine.Running = true
 		s.engine.Version = ev.Version
 		s.engine.StartedAt = ts
@@ -140,7 +159,7 @@ func (s *State) Apply(ev *CaptureEvent, ts time.Time) LogEntry {
 		if f == nil { // started before we attached
 			f = &Flow{ID: ev.FlowID, Proto: ev.Proto, Direction: ev.Direction,
 				Initiator: endpointCopy(ev.Initiator), Responder: endpointCopy(ev.Responder),
-				Service: ev.Service, Started: ts.Add(-time.Duration(ev.DurationMS) * time.Millisecond)}
+				Service: ev.Service, Started: ts.Add(-time.Duration(min(ev.DurationMS, maxDurationMS)) * time.Millisecond)}
 			if ev.ServerName != nil {
 				f.ServerName = *ev.ServerName
 			}
@@ -150,10 +169,7 @@ func (s *State) Apply(ev *CaptureEvent, ts time.Time) LogEntry {
 		f.Ended, f.EndReason, f.LastSeen = true, ev.Reason, ts
 		f.BytesOut, f.BytesIn = ev.InitBytes, ev.RespBytes
 		f.Summary = ev.Summary
-		s.recent = append(s.recent, f)
-		if len(s.recent) > maxRecentFlows {
-			s.recent = s.recent[len(s.recent)-maxRecentFlows:]
-		}
+		s.endFlow(f)
 	case "stats", "engine_stop":
 		s.applyCounters(ev, ts)
 		if ev.Type == "engine_stop" {
@@ -165,6 +181,40 @@ func (s *State) Apply(ev *CaptureEvent, ts time.Time) LogEntry {
 		s.events = s.events[len(s.events)-maxRecentEvents:]
 	}
 	return entry
+}
+
+// maxDurationMS caps a reported duration (~100 years) so the int64 conversion can't overflow.
+const maxDurationMS = uint64(100 * 365 * 24 * time.Hour / time.Millisecond)
+
+// endFlow moves an ended flow into the recent ring; a flagged flow pushed out of that ring
+// goes to the flagged ring instead of disappearing.
+func (s *State) endFlow(f *Flow) {
+	s.recent = append(s.recent, f)
+	if over := len(s.recent) - maxRecentFlows; over > 0 {
+		for _, old := range s.recent[:over] {
+			if old.Status == "flagged" {
+				s.flagged = append(s.flagged, old)
+			}
+		}
+		s.recent = s.recent[over:]
+		if len(s.flagged) > maxFlaggedKept {
+			s.flagged = s.flagged[len(s.flagged)-maxFlaggedKept:]
+		}
+	}
+}
+
+// Touch marks the engine as alive (called when it is started).
+func (s *State) Touch(t time.Time) {
+	s.mu.Lock()
+	s.lastEventAt = t
+	s.mu.Unlock()
+}
+
+// LastEventAt is when the last capture event (or engine start) was seen.
+func (s *State) LastEventAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastEventAt
 }
 
 func (s *State) applyCounters(ev *CaptureEvent, ts time.Time) {
@@ -259,17 +309,20 @@ func (s *State) Overview() Overview {
 	defer s.mu.Unlock()
 	now := s.now()
 	o := Overview{Engine: s.engine, ActiveFlows: len(s.active), GeneratedAt: now}
+	o.Engine.LastEventAt = s.lastEventAt
 	o.Traffic = append([]minuteBucket{}, s.buckets...)
 
 	// Overall risk: the riskiest flow seen within riskWindow, plus engine-level signals.
 	top := 0
 	var reasons []string
 	dest := map[string]*Destination{}
+	// Active flows count however old they are (a flagged connection that stays open stays
+	// risky); ended ones count for riskWindow after they ended (ADV-0038).
 	consider := func(f *Flow) {
 		if f.Status == "flagged" {
 			o.FlaggedFlows++
 		}
-		if now.Sub(f.LastSeen) <= riskWindow && f.Risk > top {
+		if (!f.Ended || now.Sub(f.LastSeen) <= riskWindow) && f.Risk > top {
 			top = f.Risk
 			reasons = append([]string{}, f.Reasons...)
 			if len(reasons) > 0 {
@@ -290,6 +343,9 @@ func (s *State) Overview() Overview {
 	for _, f := range s.recent {
 		consider(f)
 	}
+	for _, f := range s.flagged {
+		consider(f)
+	}
 	score := top
 	if !s.trailingSeenAt.IsZero() && now.Sub(s.trailingSeenAt) <= engineSignalTTL {
 		score += 40
@@ -298,6 +354,10 @@ func (s *State) Overview() Overview {
 	if !s.droppedSeenAt.IsZero() && now.Sub(s.droppedSeenAt) <= engineSignalTTL {
 		score += 15
 		reasons = append(reasons, "the capture dropped packets, so the record is incomplete")
+	}
+	if !s.restartSeenAt.IsZero() && now.Sub(s.restartSeenAt) <= engineSignalTTL {
+		score += 10
+		reasons = append(reasons, "the capture engine restarted, so monitoring had a gap")
 	}
 	if !s.engine.Running {
 		reasons = append(reasons, "the capture engine is not running, so nothing is being monitored")
@@ -342,8 +402,11 @@ func (s *State) Connections(state string, limit int) []Flow {
 		}
 	}
 	if state == "recent" || state == "all" {
-		for i := len(s.recent) - 1; i >= 0; i-- {
-			out = append(out, *s.recent[i])
+		ended := make([]*Flow, 0, len(s.recent)+len(s.flagged))
+		ended = append(append(ended, s.recent...), s.flagged...)
+		sort.SliceStable(ended, func(i, j int) bool { return ended[i].LastSeen.After(ended[j].LastSeen) })
+		for _, f := range ended {
+			out = append(out, *f)
 		}
 	}
 	if len(out) > limit {

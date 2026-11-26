@@ -19,6 +19,8 @@ exec "$root/scripts/dev.sh" bash -c '
   step "go test -race";  (cd services && go test -race -count=1 ./...)
   step "go fuzz (10 s)"; (cd services && go test -run=^$ -fuzz=FuzzQueryValidation -fuzztime=10s ./api)
   step "govulncheck";    (cd services && govulncheck ./...)
+  step "staticcheck";    (cd services && staticcheck ./...)
+  step "gosec";          (cd services && gosec -quiet ./...)
   step "osv-scanner";    osv-scanner scan source -r .
   step "gitleaks (full history)"; gitleaks git --no-banner --redact --log-level=warn .
   step "gitleaks (working tree)"; gitleaks dir --no-banner --redact --log-level=warn .

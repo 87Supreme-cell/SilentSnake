@@ -53,6 +53,9 @@ RUN mkdir -p $TOOLS && cd /tmp \
 
 # govulncheck (no release binaries): module hashes verified by GOSUMDB
 RUN GOFLAGS=-mod=mod go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+# staticcheck 2026.2.2 and gosec v2.30.0 (approved by Ronin 2026-11-26, ADV-0040); same verification
+RUN GOFLAGS=-mod=mod go install honnef.co/go/tools/cmd/staticcheck@v0.8.2 \
+ && GOFLAGS=-mod=mod go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
 
 # Cargo security tools, built from crates.io with their own lockfiles
 RUN cargo install --locked cargo-audit@0.23.0 cargo-deny@0.20.2 cargo-fuzz@0.13.2 \

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -22,7 +23,10 @@ import (
 	"time"
 )
 
-const defaultPort = 8765 // silentsnake.yaml llm.providers.local.port
+const (
+	defaultPort = 8765 // silentsnake.yaml llm.providers.local.port
+	maxConns    = 64   // concurrent connections (same user only; ADV-0037)
+)
 
 func main() {
 	log.SetFlags(0)
@@ -35,6 +39,21 @@ func main() {
 
 	if os.Geteuid() == 0 {
 		log.Fatal("refusing to run as root")
+	}
+	if err := harden(); err != nil {
+		log.Fatal(err)
+	}
+	if st, err := os.Open("/proc/self/status"); err != nil {
+		log.Fatalf("cannot verify privileges: %v", err)
+	} else {
+		err = checkPrivileges(st)
+		_ = st.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := checkExecutable(*bin); err != nil {
+		log.Fatal(err)
 	}
 	port, err := loopbackPort(*listen)
 	if err != nil {
@@ -65,11 +84,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	handler := NewServer(state, hub, token, port).Handler()
+	// Hold [::1]:port too, so nobody can squat it for clients that resolve "localhost" to
+	// IPv6 (ADV-0034). It serves the same handler, which refuses every non-127.0.0.1 peer.
+	if ln6, err := net.Listen("tcp6", fmt.Sprintf("[::1]:%d", port)); err == nil {
+		srv6 := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 10 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16 << 10}
+		go func() { _ = srv6.Serve(newSameUserListener(ln6, 8)) }()
+	} else {
+		log.Printf("note: cannot hold [::1]:%d (%v); clients must use 127.0.0.1", port, err)
+	}
 	srv := &http.Server{
-		Handler:           NewServer(state, hub, token, port).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
 	go func() {
@@ -79,7 +108,7 @@ func main() {
 		_ = srv.Shutdown(sctx)
 	}()
 	log.Printf("listening on http://%s (capture: %s on %s)", *listen, *bin, *iface)
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(newSameUserListener(ln, maxConns)); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
@@ -113,6 +142,8 @@ func configDir() (string, error) {
 	}
 	root := filepath.Join(base, "silentsnake")
 	dir := filepath.Join(root, "config")
+	// #nosec G703 -- the user's own data dir ($XDG_DATA_HOME, absolute); every component's
+	// owner and mode are verified below.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -126,7 +157,7 @@ func configDir() (string, error) {
 
 // private checks that path is owned by us and has no group/other permissions.
 func private(path string, isDir bool) error {
-	fi, err := os.Lstat(path)
+	fi, err := os.Lstat(path) // #nosec G703 -- our own data dir; this is the check itself
 	if err != nil {
 		return err
 	}
@@ -143,9 +174,28 @@ func private(path string, isDir bool) error {
 }
 
 // loadOrCreateToken reads the 64-hex-char token, or creates one (32 random bytes) with 0600.
+// The file is opened without following symlinks and without blocking, and its type, owner
+// and mode are checked on the open descriptor before anything is read (ADV-0043).
 func loadOrCreateToken(path string) ([]byte, bool, error) {
-	if b, err := os.ReadFile(path); err == nil {
-		if err := private(path, false); err != nil {
+	// #nosec G304 -- fixed path in our 0700 data dir; no symlinks, checked on the open fd.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err == nil {
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			return nil, false, err
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		switch {
+		case !fi.Mode().IsRegular():
+			return nil, false, fmt.Errorf("%s: not a regular file", path)
+		case !ok || int(st.Uid) != os.Getuid():
+			return nil, false, fmt.Errorf("%s: not owned by the current user", path)
+		case fi.Mode().Perm()&0o077 != 0:
+			return nil, false, fmt.Errorf("%s: permissions %o are looser than 0600; refusing to start", path, fi.Mode().Perm())
+		}
+		b, err := io.ReadAll(io.LimitReader(f, 256))
+		if err != nil {
 			return nil, false, err
 		}
 		t := strings.TrimSpace(string(b))
@@ -161,15 +211,16 @@ func loadOrCreateToken(path string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	t := hex.EncodeToString(raw)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// #nosec G304 -- fixed path in our 0700 data dir; O_EXCL|O_NOFOLLOW create.
+	w, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, false, err
 	}
-	if _, err := f.WriteString(t + "\n"); err != nil {
-		f.Close()
+	if _, err := w.WriteString(t + "\n"); err != nil {
+		_ = w.Close()
 		return nil, false, err
 	}
-	if err := f.Close(); err != nil {
+	if err := w.Close(); err != nil {
 		return nil, false, err
 	}
 	return []byte(t), true, nil
