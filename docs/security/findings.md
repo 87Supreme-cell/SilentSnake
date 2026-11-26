@@ -41,6 +41,17 @@ A milestone is **blocked** while any `critical` or `high` finding is `open`.
 | ADV-0031 | low | UDP checksums ignored: a DNS answer the kernel drops for a bad checksum is parsed and learned (phantom DNS) | capture stage A | 2026-11-26 | open |
 | ADV-0032 | medium | TPACKET_V3 + no drain at stop: packets already in the ring at `--duration` stop are discarded unprocessed and not counted as dropped (silent loss, no warning) | capture stage A | 2026-11-26 | fixed (2026-11-26) |
 | ADV-0033 | low | `packets_unprocessed_at_stop` under-counts when a blocked stdout write outlasts the drain deadlines (or the clock steps back); shutdown unbounded while the consumer stalls | capture stage A | 2026-11-26 | open (fix in tree 2026-11-26, awaiting re-test) |
+| ADV-0034 | high | Port squatting steals the API token: another local user listens on `[::1]:8765` (the API is IPv4-only) or on `127.0.0.1:8765` before the API starts; clients send `Bearer <token>` to it and accept forged data | local REST API | 2026-11-26 | open |
+| ADV-0035 | high | API has no capability or group guard: it holds `CAP_NET_RAW` (all sets, ambient) in the smoke-test deployment, and runs with `CAP_SYS_ADMIN`/`CAP_SETUID` or group 0 when given | local REST API | 2026-11-26 | open |
+| ADV-0036 | medium | Global rate limiter runs before authentication: any local user or web page without the token starves the dashboard (15/15 requests → 429) | local REST API | 2026-11-26 | open |
+| ADV-0037 | medium | No connection limit: 30,000 idle keep-alive connections from another uid pin 631 MB of API memory | local REST API | 2026-11-26 | open |
+| ADV-0038 | medium | Overall risk can be emptied: churn evicts flagged flows, an engine restart erases open ones, and a flagged flow open longer than 5 min stops counting | local REST API | 2026-11-26 | open |
+| ADV-0039 | medium | Engine liveness not monitored: a stopped engine or one over-long (> 1 MiB) line leaves `running:true` and frozen data; the long line stalls the pipe for good, with no restart | local REST API | 2026-11-26 | open |
+| ADV-0040 | medium | `gosec` and `staticcheck` (dependencies.json `static_analysis`) are not run by `gates.sh` or CI; gosec reports 7 untriaged issues | local REST API | 2026-11-26 | open |
+| ADV-0041 | low | SSE slots are held forever by clients that stop reading (no write deadline) | local REST API | 2026-11-26 | open |
+| ADV-0042 | low | `smoke-api.sh` passes without testing ::1, the Host and peer guards, the API's own privileges, or why `--listen 0.0.0.0` failed | local REST API | 2026-11-26 | open |
+| ADV-0043 | low | Token and process hygiene: dumpable API with unlimited core size holds the token; token read before its type check; `--capture-bin` owner/mode unchecked | local REST API | 2026-11-26 | open |
+| ADV-0044 | info | API observations: absolute-form target overrides Host; duplicate `flow_id`s across engine restarts; empty `limit=`/`state=` accepted; `:Z` relabel breaks concurrent dev containers | local REST API | 2026-11-26 | open |
 
 **ADV-0027 is not assigned.** The number was skipped when re-test 4 (2026-11-25) filed ADV-0028 and ADV-0029. It appears in no file and nowhere in git history (checked in re-test 5, 2026-11-26). It stays unused and must not be reused.
 
@@ -521,3 +532,214 @@ Template for each entry (copy below this line):
 - **Status log:**
   - 2026-11-26 open
   - 2026-11-26 fix proposed (builder; needs adversary re-test): kernel stats snapshot at the stop; the skim window starts when skimming starts; stop boundary is `max(now, newest processed packet ts)`. Case (a) rerun: `packets_seen 361` + `packets_unprocessed_at_stop 39639` = 40,000 of 40,000 (was 361 + 1). Unbounded shutdown under a stalled consumer remains (ADV-0026 territory).
+
+### ADV-0034: Port squatting steals the API token: clients cannot tell the real API from an impostor
+- **Severity:** high
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** CLAUDE.md §4 "REST API binds `127.0.0.1` only, token-authenticated" (the token is disclosed to another principal); dependencies.json `threat_model` > "local API abuse" ("bind 127.0.0.1 only", "token auth"); adversary.md secret hunt item 5 ("No secret may appear in full anywhere").
+- **NIST SP 800-53:** IA-3, IA-5(1), SC-23, SC-8, AC-4
+- **Reproduce:** Two containers sharing one network namespace: victim uid 1000 runs the API (`tcp4 127.0.0.1:8765`), attacker uid 1001 (a different host uid) with no access to the token file. `/etc/hosts` has `127.0.0.1 localhost` and `::1 localhost`, as on Fedora.
+  - (a) The attacker listens on `[::1]:8765`, which is free because the API listens on IPv4 only (`main.go` `net.Listen("tcp4", …)`). The victim's clients connect to `http://localhost:8765`, the name `rest-api.md` documents as an accepted Host.
+  - (b) The attacker binds `127.0.0.1:8765` while the API is not running (before login, after a crash or upgrade, or by looping on `bind`). The API then exits with `bind: address already in use`, and any client, even one using `127.0.0.1`, talks to the impostor.
+- **Evidence:** (fingerprint of a throwaway token: `first4=5b8c sha256=f3b40ae13cdf70c8`)
+  ```
+  impostor uid=1001 listening on ::1:8765
+  impostor got 'GET /v1/overview HTTP/1.1' from ::1 bearer: first4=5b8c sha256=f3b40ae13cdf70c8   (curl localhost)
+  impostor got 'GET /v1/overview HTTP/1.1' from ::1 bearer: first4=5b8c sha256=f3b40ae13cdf70c8   (Python urllib localhost)
+  impostor got 'GET /v1/overview HTTP/1.1' from ::1 bearer: first4=5b8c sha256=f3b40ae13cdf70c8   (Go net/http localhost)
+  client → {"risk": {"score": 0, "level": "low", "color": "green", ...}, "engine": {"running": true ...   (forged)
+  (b) silentsnake-api: listen tcp4 127.0.0.1:8765: bind: address already in use / api exit=1
+      impostor got 'GET /v1/overview HTTP/1.1' from 127.0.0.1 bearer: first4=5b8c sha256=f3b40ae13cdf70c8
+  ```
+  The attacker gets the full token, which it can replay against the real API to read all traffic metadata, and it can show the user a forged "all clear" (integrity). A plain TCP port on loopback has no owner, so nothing in the bearer scheme authenticates the server. Rated high rather than critical because it needs another local account and either a client that uses `localhost` or a window in which the API is not listening. The dashboard does not exist yet, so its exact behaviour is untested.
+- **Suggested fix:** Options for the builder and Ronin, since some of them touch the spec (`silentsnake.yaml` `bind_address`/`port`):
+  - Move the dashboard channel to a Unix domain socket inside the 0700 `$XDG_DATA_HOME/silentsnake/` (or `$XDG_RUNTIME_DIR`), whose file permissions authenticate both ends, and check `SO_PEERCRED`.
+  - Or keep TCP and make the server prove itself before the client sends the secret: for example a challenge/response (HMAC over a client nonce with the token) or a per-start server key written next to the token, so the client never sends the raw token first.
+  - At least: reserve `[::1]:8765` as well (listen and refuse), document that clients must use the literal `127.0.0.1`, remove `localhost` from the accepted Hosts, and make the client treat an unexpected peer as an alert.
+  - Add a smoke step for (a).
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0035: The API has no capability or group guard and runs holding `CAP_NET_RAW` (or anything it is given)
+- **Severity:** high
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** CLAUDE.md §4 "Never run as root; use `CAP_NET_RAW`/`CAP_BPF` on the capture binary only"; dependencies.json `threat_model` > "privilege escalation"; docs/api/rest-api.md "No privileges. The API refuses root and holds no capabilities."; `main.go` header comment "It holds no capabilities".
+- **NIST SP 800-53:** AC-6, AC-6(9), AC-6(10), CM-7
+- **Reproduce:** `main.go` checks only `os.Geteuid() == 0`. It doesn't check real/saved uid, gid, supplementary groups, or any capability set. (1) Run the API exactly as `scripts/smoke-api.sh` does (`--cap-drop=all --cap-add=NET_RAW`, uid 1000) and read `/proc/<api pid>/status`. (2) `--cap-drop=all --cap-add=SYS_ADMIN,SETUID,NET_RAW`, uid 1000. (3) `--group-add 0`.
+- **Evidence:**
+  ```
+  (1) api   CapInh/CapPrm/CapEff/CapAmb 0000000000002000   NoNewPrivs 1
+      child CapInh/CapPrm/CapEff/CapAmb 0000000000002000   (inherited through the ambient set)
+  (2) CapPrm/CapEff/CapAmb 0000000000202080 (SYS_ADMIN|NET_RAW|SETUID)  NoNewPrivs 0  -> api alive: yes
+  (3) Groups: 1000 0  -> "listening on http://127.0.0.1:8765"
+  ```
+  So in the only documented way of running it, the network-facing HTTP process holds `CAP_NET_RAW`, contrary to its own documentation. A memory-safety or logic bug in the API (or a future LLM-sandbox component in the same Go service) would get raw sockets, and more if more is given. Same class as ADV-0001 (high) on the capture binary.
+  Design note: with `NoNewPrivileges=yes` (CLAUDE.md, systemd hardening), file capabilities on the capture binary are **not** applied when the API execs it. So under NNP, the child can only get `CAP_NET_RAW` if the API holds it as ambient, which is exactly what this finding flags. The supervision model (API spawns the capture engine) and the "capability on the capture binary only" rule conflict, and Ronin needs to decide how to resolve it: for example, run capture as its own systemd unit with `AmbientCapabilities=CAP_NET_RAW` and feed the API through a socket/FIFO, or have the API drop every capability it doesn't pass on.
+- **Suggested fix:** Mirror `crates/capture/src/privilege.rs` in Go: refuse if any uid/gid slot is 0, if `Groups:` contains 0, or if CapInh/CapPrm/CapEff/CapAmb is non-zero, except for an explicitly configured ambient `CAP_NET_RAW` that the API must not use itself (if Ronin accepts that model). Fail closed on parse errors. Unit-test it and add the `/proc/<api>/status` check to `smoke-api.sh`. Builder decides; the architecture choice is Ronin's.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0036: The global rate limiter runs before authentication, so anyone can starve the dashboard
+- **Severity:** medium
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** dependencies.json `threat_model` > "local API abuse" ("rate limit" is meant to mitigate abuse, not create a DoS lever); CLAUDE.md §5 item 2 (live traffic must appear on the dashboard).
+- **NIST SP 800-53:** SC-5, SC-5(2), SI-4
+- **Reproduce:** `server.go` `guard`: peer → Host → method → `s.limiter.Allow()` (one process-wide bucket: 40 burst, 20/s) → token. A request with no token that passes the peer and Host checks spends a token from the same bucket the dashboard uses. A web page in the user's browser can do the same with `fetch('http://127.0.0.1:8765/v1/health', {mode: 'no-cors'})`, because the browser sends `Host: 127.0.0.1:8765`. Chrome's Local Network Access prompt may stop public sites; other browsers and local pages are not covered. Live: attacker uid 1001 (no token) runs 4 threads of `GET /v1/health` for 10 s, while the victim polls `/v1/overview` with the token at 2/s.
+- **Evidence:**
+  ```
+  attacker sent 239451 codes {401: 239, 429: 239212}
+  victim dashboard: legit(token) codes={429: 15}          (baseline without the flood: {200: 7})
+  ```
+  The monitor's UI is blind for as long as any local user, process or open web page keeps flooding. The `/v1/stream` connect also goes through the limiter, so reconnecting fails too.
+- **Suggested fix:** Check the token before the limiter, and give authenticated clients their own bucket (or no limit beyond the stream cap). Reject unauthenticated requests cheaply with their own small budget and `Connection: close`. Per-IP buckets don't help on loopback (any 127/8 source is accepted). Add a test where unauthenticated traffic must not affect an authenticated client. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0037: No connection limit: idle keep-alive connections from another user pin unbounded memory
+- **Severity:** medium
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** dependencies.json `threat_model` > "local API abuse"; docs/controls.md row "Local API cannot be ... abused locally" (SC-5).
+- **NIST SP 800-53:** SC-5, SC-6
+- **Reproduce:** `http.Server` has no connection cap (no limiting listener). `ReadHeaderTimeout` 5 s only bounds the first request. After any complete request, including one rejected 403 for a bad Host (which is not rate-limited), the connection is kept alive for `IdleTimeout` (60 s). Attacker uid 1001: open 30,000 connections from varied 127/8 source addresses, send `GET / HTTP/1.1\r\nHost: x\r\n\r\n` on each, then stay idle.
+- **Evidence:**
+  ```
+  before: VmRSS 16160 kB  fds=10   threads=18
+  opened 30000 conns in 0.7s, errors 0
+  during: VmRSS 631252 kB fds=30010
+  after 15s idle: 30000 of 30000 still open
+  after close: VmRSS 633908 kB (not returned)
+  ```
+  That is about 20 KB per connection. With the API's `RLIMIT_NOFILE` of 524,288, a single other user can push it towards ~10 GB, or to `EMFILE`, where `Accept` fails for the dashboard as well. Re-sending one rejected request every <60 s per connection keeps them all open. The dashboard was still served at 30k (5 ms).
+- **Suggested fix:** Wrap the listener with a connection cap (a small semaphore listener; stdlib only), set `Connection: close` on every pre-auth rejection (403/401/405/429), use a shorter idle timeout until a connection has authenticated, and consider `SetKeepAlivesEnabled(false)` apart from the stream. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0038: The overall risk score can be emptied by churn, by an engine restart, or by time while the flagged flow is still open
+- **Severity:** medium
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** docs/api/rest-api.md "The overall score is the riskiest flow seen in the last 5 minutes"; CLAUDE.md §5 item 2 ("with risk scores"); dependencies.json `threat_model` > "local API abuse" / integrity of what the user sees.
+- **NIST SP 800-53:** SI-4, SI-4(5), AU-5, AU-6
+- **Reproduce:** `state.go`. Flagged flow on lo: ClientHello with SNI `bad host.example` and a duplicated SNI extension (`sni_unusual_characters` + `duplicate_extension` = 60, `elevated`).
+  - (a) **Churn:** `recent` keeps the last 500 ended flows and `events` the last 500 events, by count. After the flagged flow ends, 600 TCP connects to closed loopback ports (RST, about 2 s).
+  - (b) **Engine restart:** `engine_start` replaces `s.active` with an empty map without moving the old flows to `recent`, and clears `last_error`. With a flagged flow still open, SIGKILL the capture child (the OOM killer, a crash or a same-user process can do this).
+  - (c) **Age:** `LastSeen` of an active flow is set only by `flow_start`/`tls_client_hello`, and `Overview()` counts a flow only if `now - LastSeen <= 5 min`, so any flow open longer than 5 minutes stops counting while it is still open.
+- **Evidence:**
+  ```
+  (a) after flagged flow ended:  risk=60/elevated flagged=1 ... recent: listed=7 flagged_in_list=1
+      churn: 600 connects to closed ports
+      after 600 churn flows:     risk=0/low flagged=0 ... recent: listed=500 flagged_in_list=0; /v1/events?limit=500: 0 matches
+  (b) flagged flow active:       risk=60/elevated flagged=1 active=1 running=True
+      +0.5 s (killed):           risk=60 running=False err='signal: killed' (+ "engine is not running")
+      +2.5 s (restarted):        risk=0/low flagged=0 active=0 running=True err='' reasons=[]   (connection still open)
+  (c) harness (scratch copy of State, fixed clock), inbound Telnet + legacy_tls_version, still active:
+      t+1m  flow_risk=75 flagged overall=75/high/red
+      t+4m  flow_risk=75 flagged overall=75/high/red
+      t+6m  flow_risk=75 flagged overall=0/low/green reasons=[]
+      t+1h  flow_risk=75 flagged overall=0/low/green reasons=[]
+      live: 60/elevated at 153 s, then risk=0/low with flagged_flows=1 at 313 s
+  ```
+  (a) needs no privileges and hides a finished intrusion within seconds; (c) needs nothing at all: an inbound session simply stays open, and the dashboard turns green after 5 minutes.
+- **Suggested fix:** Count every *active* flow towards the overall score regardless of age (or refresh `LastSeen` from per-flow activity, which needs an engine `flow_update` or per-flow counters in `stats`). Keep ended flows by time (everything that ended within the risk window) or keep flagged flows in their own bounded list, separate from the count-based `recent`/`events` rings. On `engine_start`, move the remaining active flows to `recent` with `end_reason: engine_restart`, and record restarts (count, last time, last error) as an engine signal that adds points and a reason for `engineSignalTTL`. Add tests for all three. Builder decides; the rule table is Ronin's.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0039: Engine liveness is not monitored: a stalled engine, or one over-long line, freezes the dashboard while it says "running"
+- **Severity:** medium
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** docs/api/rest-api.md "If the engine exits, the API restarts it ... The failure is visible in `/v1/overview`"; `capture.go` comment "longer lines are rejected, not buffered"; docs/controls.md "Capture completeness is visible" (AU-5).
+- **NIST SP 800-53:** AU-5, SI-4, SI-6
+- **Reproduce:** (1) `kill -STOP` the capture child for 8 s while sending traffic. (2) `--capture-bin` pointing to a fake engine that writes a valid `engine_start`, three `stats` lines, then one 1.1 MiB line, then more `stats`. In `consume()`, `bufio.Scanner` returns false on `ErrTooLong`. The function returns without checking `sc.Err()` and stops reading stdout. `cmd.Wait()` then waits forever for an engine that is blocked writing to a full pipe. The 1 MiB cap is above what the real engine emits today (ADV-0006 peaks at ~172 KB), but nothing enforces that, and new fields such as stage C process command lines will grow events.
+- **Evidence:**
+  ```
+  (1) before: running=True pkts=10;  stopped +2/+4/+6/+8 s: running=True pkts=10 err='' reasons=[]
+  (2) t=2.5 s pkts=300; t=5.5 s pkts=300; t=11.5 s pkts=300; running=True rejected=0 err=''
+      fake engine State: S (sleeping) [blocked write]; no restart
+  ```
+  In both cases the overview stays "running", with no error, no reason and stale data (the overview has no "last event at" field). In (2) the state is permanent: monitoring is off until someone restarts the API.
+- **Suggested fix:** A watchdog: the engine is started with `--stats 1`, so if no event arrives for N seconds (for example 5), set `running:false`, a `stale` reason and risk points, and kill and restart the child. Expose `last_event_at`. Treat a too-long line as rejected: read with a reader that discards up to the next newline and counts `events_rejected`, or kill and restart the child, and always check `sc.Err()`. Add the fake-engine cases as tests. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0040: `gosec` and `staticcheck` are not run by any gate; gosec reports 7 untriaged issues
+- **Severity:** medium
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** CLAUDE.md §4 "All `security_tooling` and `smoke_tests` in `dependencies.json` gate every merge"; dependencies.json `security_tooling.static_analysis` ("staticcheck", "gosec"), `audit_cadence.per_commit` ("static_analysis").
+- **NIST SP 800-53:** SA-11, SA-11(1), RA-5
+- **Reproduce:** `grep -n "gosec\|staticcheck" scripts/*.sh .github/workflows/*.yml` finds nothing, although both tools are installed in the dev image (`dev/Containerfile`). Run them on a scratch copy of `services/`: `staticcheck ./...` and `gosec -quiet ./...`.
+- **Evidence:** `staticcheck`: clean. `gosec` 2.30.0: `Issues : 7`:
+  - G115 (HIGH) `state.go:143`: `time.Duration(ev.DurationMS)` converts uint64 to int64; a huge `duration_ms` from the engine wraps `Started`.
+  - G703 ×2 (HIGH) `main.go:116/129`: path from `$XDG_DATA_HOME`, same-user input, likely by design.
+  - G204 `capture.go:54`: `--capture-bin` exec, by design (see ADV-0043).
+  - G304 ×2 `main.go:147/164`.
+  - G104 `main.go:169`: unchecked `f.Close()` on the error path.
+
+  Most are low-impact or false positives, but no gate surfaces them and none is triaged or suppressed with a reason.
+- **Suggested fix:** Add `staticcheck ./...` and `gosec ./...` steps to `scripts/gates.sh` (CI runs that script), fix G115/G104, and suppress the by-design ones with `#nosec <rule> -- <reason>`. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0041: SSE stream slots are held forever by clients that stop reading
+- **Severity:** low
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** docs/api/rest-api.md "At most 4 concurrent streams" (availability of the dashboard stream); dependencies.json `threat_model` > "local API abuse".
+- **NIST SP 800-53:** SC-5
+- **Reproduce:** Open 4 `/v1/stream` connections with the token and a 4 KiB receive buffer, never read, keep the sockets open, and generate loopback traffic. `stream()` blocks in `fmt.Fprintf` once the socket buffers fill. There is no write deadline, so `r.Context()` is never checked and the slot is never released.
+- **Evidence:** `5th stream while 4 held: 429`; `5th stream after 20s more (held streams unread, not closed): 429`; after the holders exit: `new stream http=200`. Needs the token, so this is the same user, but a suspended or hung widget or dashboard instance does the same by accident (the dashboard plus widgets are several clients).
+- **Suggested fix:** Set a per-write deadline (`http.NewResponseController(w).SetWriteDeadline` before each event), send a heartbeat, and drop a subscriber whose hub queue stays full for N seconds. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0042: `smoke-api.sh` passes without testing several things its claim depends on
+- **Severity:** low
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** dependencies.json `smoke_tests` "REST API refuses connections from non-127.0.0.1 addresses"; adversary.md item 9 ("A smoke test that passes but does not test what it claims is a finding").
+- **NIST SP 800-53:** SA-11, CA-2
+- **Reproduce:** Read `scripts/smoke-api.sh` and compare it with the live results in this run. It passed twice (`external_ip=192.168.4.40`, `external_code=000`, `wildcard_exit=1`) while the following held:
+  - (1) Nothing checks `[::1]:8765`, so it passes while anyone can squat it (ADV-0034).
+  - (2) The per-request peer and Host guards are never exercised live. They are covered only by unit tests with `httptest`. Literally, the API accepts any 127/8 peer (`127.0.0.2` → 200), which is fine for loopback but not what the test name says.
+  - (3) It runs the API holding `CAP_NET_RAW` and never inspects the API's own credentials (ADV-0035).
+  - (4) `wildcard_exit` passes on any non-zero exit with stderr discarded, so a token or permission error would also pass.
+  - (5) `external_code=000` is any curl failure, not specifically "connection refused".
+- **Evidence:** PASS ×2 in this run, together with the live results of ADV-0034, ADV-0035 and the `127.0.0.2` probe.
+- **Suggested fix:** Add `curl -g http://[::1]:8765/` (must fail, or must hit the API's own refusing listener), a bad-Host request (403), `/proc/<api>/status` Cap*/Groups assertions, an assertion on the `refusing to listen` message, and curl's exit code 7 for the external address. Align the dependencies.json wording ("127.0.0.0/8") with Ronin. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0043: Token and process hygiene in the API
+- **Severity:** low
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** adversary.md secret hunt item 4 ("core dumps are disabled (`RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`) on processes that hold keys"); CLAUDE.md §3 ("No plaintext ... crash dumps"); CLAUDE.md §2 (permissions checked before use).
+- **NIST SP 800-53:** SC-28, SI-11, CM-5, AC-6
+- **Reproduce/Evidence:**
+  - (1) `/proc/<api>/limits`: `Max core file size unlimited`, and `/proc/<api>/environ` is owned by the user, so the process is dumpable while it holds `<token>` in memory. With `GOTRACEBACK=crash` (or a runtime crash under systemd-coredump), the token lands in a core file outside the 0700 tree. The token was not found in argv, environ, logs or error bodies (0 matches in every run).
+  - (2) `loadOrCreateToken` calls `os.ReadFile` (which follows symlinks and blocks on a FIFO) before `private()` checks the type with `Lstat`. Exploiting this needs same-user write access to the 0700 dir, so the impact is minimal; the order is still wrong, and a race (TOCTOU) between the read and the check is possible.
+  - (3) `--capture-bin` is executed without checking owner or mode: a `-rwxrwxrwx` fake engine in `/tmp` was accepted and run (C8). A group- or world-writable engine binary would let another user run code as this user. The child also inherits the API's whole environment.
+  - (4) `configDir` checks `silentsnake/` and `config/` but not the `$XDG_DATA_HOME` base.
+- **Suggested fix:** `prctl(PR_SET_DUMPABLE, 0)` and `setrlimit(RLIMIT_CORE, 0)` at start (stdlib `syscall`); open the token with `O_NOFOLLOW|O_NONBLOCK`, `fstat` it, check type, owner and mode on the open fd, then read it with a size cap; refuse a `--capture-bin` that is group/world-writable or not owned by the user or root (and the same for its directory); pass the child a minimal environment. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0044: API observations (no direct exploit)
+- **Severity:** info
+- **Milestone / commit:** local REST API @ 90932e7
+- **Found:** 2026-11-26 (report: pentest-2026-11-26-api.md)
+- **Violates:** n/a (observations); related: docs/api/rest-api.md, ADV-0018.
+- **NIST SP 800-53:** SC-7, SI-10, AU-3, CM-2
+- **Reproduce/Evidence:**
+  - (1) An absolute-form request target overrides the Host header: `GET http://127.0.0.1:8765/v1/health` with `Host: evil.example:8765` → 200, while `GET http://evil.example:8765/…` with a good Host → 403. Browsers never send absolute-form to an origin server, so DNS rebinding is still blocked. Checking both `r.Host` and the raw `Host` header would close it.
+  - (2) After an engine restart, `flow_id` starts again at 1 while `recent` keeps the previous run's flows, so `/v1/connections` can list two different flows with the same `flow_id`. A client keyed on `flow_id` merges them (ADV-0018 at the API level).
+  - (3) `limit=` and `state=` with empty values are accepted as defaults (doc: "absent means default"; empty is not absent).
+  - (4) `scripts/dev.sh` and the smoke scripts mount the repo with `:Z` (private SELinux label). Two concurrent containers take the files away from each other: `gates.sh` failed twice in this run with `Permission denied` on `/work` while another container started. That gives spurious gate failures; a mix-up could also turn into a false pass if a step's error is ignored. `:z` (shared label) avoids it.
+- **Suggested fix:** As in each item; builder decides.
+- **Status log:**
+  - 2026-11-26 open
