@@ -43,3 +43,6 @@ credentials*
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+
+# Release output (scripts/release.sh)
+/dist/

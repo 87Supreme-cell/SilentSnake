@@ -3,11 +3,16 @@
 # captures loopback traffic". Runs the debug binary in the pinned dev container as a
 # non-root user holding only CAP_NET_RAW, generates loopback traffic, and checks the events.
 # Also checks that the engine refuses root and capabilities beyond CAP_NET_RAW.
-#   scripts/smoke-capture-loopback.sh        (builds first)
+#   scripts/smoke-capture-loopback.sh        (builds the debug binary, runs in the dev container)
+# Release use (scripts/release.sh) tests the shipped binary in the target distribution's image:
+#   SMOKE_BIN=dist/<...>/silentsnake-capture SMOKE_IMAGE=<build image tag> scripts/smoke-capture-loopback.sh
+#   SMOKE_BIN is relative to the repository root.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-tag="silentsnake-dev:$(sha256sum "$root/dev/Containerfile" | cut -c1-12)"
-"$root/scripts/dev.sh" cargo build -q -p silentsnake-capture
+tag="${SMOKE_IMAGE:-silentsnake-dev:$(sha256sum "$root/dev/Containerfile" | cut -c1-12)}"
+if [ -z "${SMOKE_BIN:-}" ]; then
+  "$root/scripts/dev.sh" cargo build -q -p silentsnake-capture
+fi
 
 run() { # run <user> <extra podman args...> -- <bash script>
   local user="$1"; shift
@@ -17,7 +22,8 @@ run() { # run <user> <extra podman args...> -- <bash script>
     -v "$root:/work:Z" "$tag" bash -c "$1"
 }
 fail() { echo "FAIL: $*" >&2; exit 1; }
-bin=./target/debug/silentsnake-capture
+bin="./${SMOKE_BIN:-target/debug/silentsnake-capture}"
+[ -x "$root/${bin#./}" ] || fail "binary not found: $bin"
 me="$(id -u):$(id -g)"
 
 # 1. Unprivileged user + CAP_NET_RAW only: live loopback capture works.
@@ -49,4 +55,4 @@ echo "ok: extra capabilities refused"
 run "$me" -- "$bin -i lo --duration 1" >/dev/null 2>&1; rc=$?
 [ $rc -eq 1 ] || fail "capture without CAP_NET_RAW did not fail cleanly (exit $rc)"
 echo "ok: no CAP_NET_RAW -> clean failure"
-echo "PASS: smoke-capture-loopback"
+echo "PASS: smoke-capture-loopback ($bin in $tag)"

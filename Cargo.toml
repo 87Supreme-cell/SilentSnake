@@ -31,3 +31,4 @@ all = { level = "deny", priority = -1 }
 [profile.release]
 codegen-units = 1
 lto = true
+strip = "symbols"             # no symbol or path debris in shipped binaries

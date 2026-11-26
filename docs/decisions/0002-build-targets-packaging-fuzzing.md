@@ -17,6 +17,8 @@ Each release is built natively for each supported distribution, in a pinned buil
 
 ### 2. Packaging: signed tarball now, native packages later
 - **Now:** one tarball per target containing the binary, `LICENSE`, the SBOM (syft, SPDX + CycloneDX), checksums and a cosign signature, plus an install script. The script installs to `~/.local/bin` (user) or `/usr/local/bin` (system) and applies `setcap cap_net_raw=ep` (needs sudo once). This works on immutable hosts without package layering.
+- **Signing (Ronin, 2026-11-25): keyless cosign (Sigstore) from CI**, with SLSA build provenance. No long-lived signing key exists; the public transparency log records the CI workflow identity, not a personal email. Until CI exists, every tarball is a local, **unsigned** build (`scripts/release.sh` says so) and is not published.
+- **Release pipeline:** `scripts/release.sh <target>` runs the gates, two network-isolated builds that must be byte-identical, the loopback smoke test with the release binary in the target's image, then packages deterministically. Build containers: `release/<target>/Containerfile` (Fedora 45 first, per Ronin).
 - **Later:** `.deb` and `.rpm` (which can set the capability themselves), when Ronin asks.
 - **Not suitable:** Flatpak, Snap and AppImage can't carry `CAP_NET_RAW` for the capture binary.
 
