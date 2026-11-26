@@ -1,0 +1,47 @@
+# Fuzz targets for the capture engine (cargo-fuzz). Never shipped; separate workspace.
+# Approved pins (Ronin, 2026-11-25): libfuzzer-sys =0.4.13. Toolchain: nightly-2026-11-10.
+#   scripts/fuzz.sh [target] [seconds]
+[package]
+name = "silentsnake-capture-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+silentsnake-capture = { path = "../crates/capture", version = "=0.1.0" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls"
+path = "fuzz_targets/tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine"
+path = "fuzz_targets/engine.rs"
+test = false
+doc = false
+bench = false

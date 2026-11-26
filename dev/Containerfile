@@ -65,6 +65,16 @@ RUN dnf -y install --setopt=install_weak_deps=False libcurl-devel && dnf clean a
  && cargo install --locked cargo-geiger@0.14.0 \
  && rm -rf /opt/cargo/registry/cache /opt/cargo/registry/src
 
+# Pinned nightly, used ONLY for cargo-fuzz and cargo-miri; release builds stay on stable
+# (rust-toolchain.toml). Approved by Ronin 2026-11-25 (docs/decisions/0002). The published
+# channel manifest must match the approved hash; rustup then verifies every component
+# against that manifest. Use it explicitly: cargo +nightly-2026-11-10 fuzz|miri ...
+RUN curl -fsSLo /tmp/nightly.toml https://static.rust-lang.org/dist/2026-11-10/channel-rust-nightly.toml \
+ && echo "c2986ce080bf1c0e2b96a20d8e704ab33fdd95f1e347f75e0e6ace780909620c  /tmp/nightly.toml" | sha256sum -c - \
+ && rm /tmp/nightly.toml \
+ && rustup toolchain install nightly-2026-11-10 --profile minimal -c miri,rust-src \
+ && rustup default 1.99.0
+
 # Unprivileged user; the repo is mounted at /work. Toolchain dirs stay root-owned.
 RUN useradd -m -u 1000 dev && mkdir -p /work && chown dev:dev /work
 USER dev

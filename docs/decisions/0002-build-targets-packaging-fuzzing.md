@@ -24,5 +24,8 @@ Each release is built natively for each supported distribution, in a pinned buil
 - A single dated nightly, at least two weeks old (`version_policy`), installed in the dev container next to stable and used **only** for `cargo fuzz` (packet parsers) and `cargo miri` (the `ffi` crate). Release binaries are always built with stable (`rust-toolchain.toml`).
 - **Pin (Ronin, 2026-11-25): `nightly-2026-11-10`** (rustc 1.102.0-nightly ac8310ba6), channel manifest SHA-256 `c2986ce080bf1c0e2b96a20d8e704ab33fdd95f1e347f75e0e6ace780909620c`; `miri` and `rust-src` available. The Containerfile checks the published manifest against this hash before rustup installs from it (rustup then verifies every component against the manifest).
 
+- **Fuzz dependencies (Ronin, 2026-11-25):** `libfuzzer-sys =0.4.13` (crate checksum `a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2`), in the separate, never-shipped `fuzz/` workspace with its own `Cargo.lock` and `fuzz/deny.toml`. That file adds `NCSA` (LLVM libFuzzer, bundled) to the license allowlist for the fuzz workspace only. Transitive crates new to the project: `arbitrary 1.5.0` (2026-10-06), `jobserver 0.1.35` (2026-07-06), `getrandom 0.4.3` (2026-06-17), `r-efi 6.0.0` (2026-02-03, UEFI targets only, never compiled here). All are MIT/Apache-2.0 and at least two weeks old. cargo-deny, cargo-audit and osv-scanner are clean on `fuzz/Cargo.lock`.
+- Run with `scripts/fuzz.sh [target] [seconds]`; targets `dns`, `tls`, `decode`, `engine`. Seeds in `fuzz/seeds/`.
+
 ## Open (needs Ronin)
 - Base image digests for the Ubuntu 26.04 and Debian 13 build containers (proposed when that work starts).

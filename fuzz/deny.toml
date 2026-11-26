@@ -1,0 +1,23 @@
+# Fuzz workspace only: adds NCSA (LLVM libFuzzer bundled in libfuzzer-sys), approved by Ronin 2026-11-25.
+# cargo-deny: licenses, bans, advisories, sources (dependencies.json security_tooling)
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+allow = ["MIT", "NCSA", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -29,8 +29,9 @@ A milestone is **blocked** while any `critical` or `high` finding is `open`.
 | ADV-0018 | low | No run identifier in the envelope: restarts and spliced streams can't be detected from `seq` | capture stage A | 2026-11-25 | open |
 | ADV-0019 | info | SSH key passphrase protection not verified by the adversary (needs a manual check) | capture stage A | 2026-11-25 | open |
 | ADV-0020 | info | cargo-fuzz gate not yet runnable (nightly not approved); substitute coverage recorded | capture stage A | 2026-11-25 | open |
-| ADV-0021 | medium | ADV-0015 fix side effect: a ClientHello plus more data in one large segment loses its SNI | capture stage A | 2026-11-25 | open |
-| ADV-0022 | low | Privilege guard ignores supplementary group 0 (`Groups:`) | capture stage A | 2026-11-25 | open |
+| ADV-0021 | medium | ADV-0015 fix side effect: a ClientHello plus more data in one large segment loses its SNI | capture stage A | 2026-11-25 | fixed (2026-11-25) |
+| ADV-0022 | low | Privilege guard ignores supplementary group 0 (`Groups:`) | capture stage A | 2026-11-25 | fixed (2026-11-25) |
+| ADV-0023 | medium | SNI lost when the ClientHello is fragmented into many tiny TLS records | capture stage A | 2026-11-25 | open |
 
 ## Findings
 
@@ -325,6 +326,7 @@ Template for each entry (copy below this line):
 - **Suggested fix:** Instead of discarding an oversized first segment, keep at most `MAX_TLS_BUFFER` bytes of it (truncate the copy) and parse that prefix. This keeps the memory bound from ADV-0015 and keeps the SNI. Add a test with a hello followed by more than 17 KB in the same segment. Builder decides.
 - **Status log:**
   - 2026-11-25 open
+  - 2026-11-25 fixed (re-test 2 @ 37f2de8, report pentest-2026-11-25.md "Re-test 2"): `feed_tls` buffers the first `MAX_TLS_BUFFER` bytes and parses them. `hello_followed_by_bulk_data_in_one_segment_keeps_sni` passes (31/31). Live on lo: a hello + 32 KB in one write now yields `server_name b-hello-plus-data.example`. An oversized, never-completing first segment is counted as `tls_unparsed` and its slot is freed at once, so the buffer stays bounded at `MAX_TLS_BUFFER`. Separate, pre-existing evasion found while testing: new ADV-0023.
 
 ### ADV-0022: Privilege guard ignores supplementary group 0
 - **Severity:** low
@@ -335,5 +337,18 @@ Template for each entry (copy below this line):
 - **Reproduce:** `podman run ... --user "$(id -u):$(id -g)" --group-add 0 --cap-add=NET_RAW ... silentsnake-capture -i lo --duration 1`. `parse_status` does not read the `Groups:` line.
 - **Evidence:** `Gid: 1000 1000 1000 1000 Groups: 1000 0` -> `rc=0` (the capture runs). The process can read and write files that are group-owned by root.
 - **Suggested fix:** Parse `Groups:` and refuse gid 0 there too (fail closed if the line is missing). Builder decides.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-25 fixed (re-test 2 @ 37f2de8): `Groups:` is parsed and required (missing line fails closed, unit test). `refuses_supplementary_root_group` passes. Live: `--group-add 0` (Groups `1000 0`) is refused with exit 3; baselines `Groups 1000` and `Groups 1000 10` run (exit 0). Cosmetic: the refusal message prints uids/gids but not the supplementary groups that triggered it.
+
+### ADV-0023: SNI lost when the ClientHello is fragmented into many tiny TLS records
+- **Severity:** medium
+- **Milestone / commit:** capture stage A @ 37f2de8
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 2")
+- **Violates:** dependencies.json `capture_integration_roadmap` stage A ("TLS SNI"); docs/controls.md "Capture completeness is visible".
+- **NIST SP 800-53:** SI-4, AU-3
+- **Reproduce:** RFC 8446 §5.1 lets a sender fragment a handshake message across records of any size, including 1 byte. Each record adds a 5-byte header, so a ~3 KB ClientHello sent as 1-byte records is ~19 KB on the wire. That is more than `MAX_TLS_BUFFER` (17,408 B), which caps the raw record stream rather than the reassembled handshake. The engine gives up (counted as `tls_unparsed`), but the server accepts the hello. This is not a regression: the cap on accumulated bytes predates the ADV-0015 and ADV-0021 fixes. It is a deliberate-evasion technique, like ADV-0004, and it is cheap for malware to use.
+- **Evidence:** Live on lo at 37f2de8, `d-tiny-records.example` (3,000-byte pad, 1-byte records): no `server_name`; run totals `tls_client_hellos 2`, `tls_unparsed 2` (the other unparsed is the deliberate never-completing case), `kernel_dropped 0`.
+- **Suggested fix:** Bound the *reassembled handshake* (`MAX_HANDSHAKE`), and strip record headers as segments arrive (store only handshake bytes), instead of bounding raw stream bytes. Alternatively, flag `tls_record_fragmentation` as an anomaly on the flow so the evasion is visible per flow. Builder decides.
 - **Status log:**
   - 2026-11-25 open

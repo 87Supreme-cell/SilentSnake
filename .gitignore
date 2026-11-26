@@ -37,3 +37,9 @@ credentials*
 
 # Session checkpoint (local only)
 /CHECKPOINT.md
+
+# Fuzzing output (seeds in fuzz/seeds/ are committed)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
