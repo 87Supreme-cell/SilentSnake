@@ -40,7 +40,7 @@ jobs:
       - name: Smoke test (non-root + CAP_NET_RAW loopback capture)
         run: scripts/smoke-capture-loopback.sh
 
-      - name: Smoke test (REST API: 127.0.0.1 only, token required)
+      - name: "Smoke test (REST API: 127.0.0.1 only, token required)"
         run: scripts/smoke-api.sh
 
       - name: Fuzz smoke (30 s per target)
