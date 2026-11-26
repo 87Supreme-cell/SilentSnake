@@ -5,6 +5,9 @@
 
 **See every connection your Linux machine makes, explained in plain English, without anything leaving the machine.**
 
+![SilentSnake dashboard on live traffic](docs/proof/screenshots/dashboard.png)
+<sub>The real app on real traffic (`scripts/screenshot-app.sh`): capture engine → local API → Flutter dashboard.</sub>
+
 SilentSnake is a fully local monitor for inbound and outbound traffic, processes, web sessions and systemd daemons. It is planned to include a real-time dashboard, desktop widgets, encrypted audit-grade logs and a sandboxed LLM analyst. This README only claims what a test, a CI run or a pentest report demonstrates.
 
 ## Status
@@ -12,8 +15,8 @@ SilentSnake is a fully local monitor for inbound and outbound traffic, processes
 | Component | State |
 |---|---|
 | Capture engine, stage A (Rust, libpcap): flows, DNS, TLS SNI, plain-English summaries | **Working.** Released as [v0.1.0](https://github.com/87Supreme-cell/SilentSnake/releases/tag/v0.1.0) (Fedora 45, x86_64), signed, with hardening fixes on `main` since |
-| Local REST API (Go, `127.0.0.1:8765`) | In progress |
-| Dashboard (Flutter desktop) | In progress |
+| Local REST API (Go, `127.0.0.1:8765`): token auth, live overview, connections, event stream, risk score v0 | **Working.** Smoke-tested in CI ([`docs/api/rest-api.md`](docs/api/rest-api.md)) |
+| Dashboard (Flutter, Linux desktop): risk ring, live connections, alerts, traffic, live log | **Working**, first version. Widget-tested in CI ([`app/`](app/)) |
 | Process / systemd attribution (eBPF), encrypted log store, LLM analyst, widgets | Planned (see [Roadmap](#roadmap)) |
 
 ## What it shows today
@@ -29,6 +32,12 @@ Capture stopped because the requested duration elapsed: 4 packets seen, 3 flows 
 ```
 
 On a real interface, flows are named from TLS SNI or from earlier DNS answers. Direction is classified as outbound, inbound, local or transit. Every run ends with counters that state whether the record is complete (kernel drops, packets left unprocessed). The event schema is [`docs/api/capture-events.md`](docs/api/capture-events.md).
+
+## Run it on your machine
+
+1. **Capture engine.** Install a release (see [Install a release](#install-a-release-fedora-45-x86_64)), or build the current `main` into an installable tarball with `scripts/release.sh fedora-45` and run its `install.sh`. The installer grants only `CAP_NET_RAW`, using `sudo setcap`; that step is yours.
+2. **API.** Build it with `scripts/dev.sh bash -c 'cd services && go build -trimpath -o /work/target/silentsnake-api ./api'`, then run `target/silentsnake-api`. By default it uses `~/.local/bin/silentsnake-capture` on all interfaces and serves `127.0.0.1:8765`. On first run it creates its token (mode 0600).
+3. **Dashboard.** Build it with `scripts/app.sh flutter build linux --release`, then run `app/build/linux/x64/release/bundle/silentsnake`.
 
 ## 60-second proof
 _Pending. It needs the dashboard, the log store and the analyst (`scripts/demo-60s.sh`, recordings in `docs/proof/`)._
@@ -59,7 +68,8 @@ From `threat_model` in [`dependencies.json`](dependencies.json):
 | Tampered or malicious dependencies | Every dependency is pinned with hashes. `cargo-deny`, `cargo-audit` and `osv-scanner` gate every push. No new dependency without owner approval |
 | Leaked secrets | `gitleaks` scans the full history and the working tree in a pre-commit gate and in CI |
 | Evasion or blinding of the monitor | Red-team re-tests after every milestone (below). Drops and incomplete records are always reported, never hidden |
-| Log tampering, local API abuse, LLM exfiltration | Designed (hash chain, signed exports, 127.0.0.1 + token, sandbox without egress) but **not built yet** |
+| Local API abuse | Listens on 127.0.0.1 only (checks the peer and the Host header too), constant-time bearer token in a 0600 file, read-only GET, strict input validation, rate limit. Proven by `scripts/smoke-api.sh` in CI and fuzzed |
+| Log tampering, LLM exfiltration | Designed (hash chain, signed exports, sandbox without egress) but **not built yet** |
 
 ## Crypto design
 _Planned with the log store:_ AES-256-GCM (AEAD) at rest through `aws-lc-rs`, keys sealed to the machine (TPM 2.0, otherwise the kernel keyring with a passphrase), Ed25519 / ECDSA P-256 signatures on every log open and close, a hash-chained audit log, and FIPS mode switched by config. None of this is implemented yet, and none of it is claimed.
@@ -119,7 +129,7 @@ Capture stages from `capture_integration_roadmap` in [`dependencies.json`](depen
 | D | Optional inspection of your own HTTPS (mitmproxy, off by default) | Planned |
 | E | Optional Zeek protocol analytics | Planned |
 
-Alongside those: the local REST API and dashboard (in progress), the encrypted log store, the LLM analyst sandbox, desktop widgets and the 60-second proof recording.
+Alongside those: the encrypted log store, the LLM analyst sandbox, desktop widgets and the 60-second proof recording.
 
 ## License
 MIT. See [LICENSE](LICENSE).

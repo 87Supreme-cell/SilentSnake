@@ -1,5 +1,7 @@
 package main
 
+import "net"
+
 // Risk v0: transparent, rule-based heuristics over what stage A can see (no process
 // attribution yet). Every point added comes with a plain-English reason, and the score is a
 // prompt to look, not a verdict. Rules are documented in docs/api/rest-api.md.
@@ -25,6 +27,14 @@ func levelFor(score int) Level {
 	}
 }
 
+func linkLocalOrMulticast(e *Endpoint) bool {
+	if e == nil {
+		return false
+	}
+	ip := net.ParseIP(e.IP)
+	return ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast())
+}
+
 // FlaggedAt is the flow score from which a connection is listed as "flagged".
 const FlaggedAt = 50
 
@@ -38,7 +48,10 @@ func scoreFlow(f *Flow) {
 		score += pts
 		reasons = append(reasons, why)
 	}
-	if f.Direction == "inbound" {
+	// Inbound counts only for TCP/UDP from a routable peer: ICMPv6 neighbour discovery and
+	// router adverts from link-local addresses are how IPv6 works, not someone connecting in
+	// (false positive seen on live data, 2026-11-26).
+	if f.Direction == "inbound" && (f.Proto == "tcp" || f.Proto == "udp") && !linkLocalOrMulticast(f.Initiator) {
 		add(25, "another machine opened this connection to you")
 	}
 	if f.Direction == "transit" {

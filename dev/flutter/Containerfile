@@ -1,0 +1,31 @@
+# SilentSnake app (Flutter) build container: kept separate from dev/Containerfile so the
+# Rust/Go toolchain image (and CI cache key) is unaffected by frontend toolchain changes.
+# Same pinned Fedora base. Flutter is pinned by version and SHA-256 from the official release
+# manifest (dependencies.json toolchains.dart_flutter; version_policy applies).
+FROM registry.fedoraproject.org/fedora:45@sha256:92837d4834c1cff45cc2d534b655489b8e536271de1897932117e396cc9980c5
+
+# Linux desktop build dependencies. Fedora RPMs can't be pinned exactly; the installed set is
+# recorded at /etc/silentsnake-rpm.lock (same policy as dev/Containerfile).
+RUN dnf -y install --setopt=install_weak_deps=False \
+      clang cmake ninja-build pkgconf-pkg-config gtk3-devel xz-devel libstdc++-devel \
+      git-core curl xz tar unzip which findutils procps-ng mesa-libGL mesa-libEGL \
+      xorg-x11-server-Xvfb mesa-dri-drivers xwd netpbm-progs dejavu-sans-fonts \
+ && dnf clean all \
+ && rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /etc/silentsnake-rpm.lock \
+ && useradd -u 1000 -m dev
+
+# Flutter 3.50.1 stable (2026-11-20; Dart 3.14.0; engine commit ae9b586f).
+RUN curl -fsSLo /tmp/flutter.tar.xz https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.50.1-stable.tar.xz \
+ && echo "4ad17fc8462fbcef2ba19ff4a78c0a16b7147fde1add8578e267ea62cdb92678  /tmp/flutter.tar.xz" | sha256sum -c - \
+ && tar -C /opt -xJf /tmp/flutter.tar.xz && rm /tmp/flutter.tar.xz \
+ && chown -R dev:dev /opt/flutter
+
+USER dev
+ENV PATH=/opt/flutter/bin:$PATH PUB_CACHE=/home/dev/.pub-cache \
+    FLUTTER_SUPPRESS_ANALYTICS=true CI=true
+RUN git config --global --add safe.directory /opt/flutter \
+ && flutter --disable-analytics && dart --disable-analytics \
+ && flutter config --no-cli-animations --enable-linux-desktop \
+ && flutter precache --linux \
+ && flutter --version
+WORKDIR /work

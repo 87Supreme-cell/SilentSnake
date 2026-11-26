@@ -47,3 +47,21 @@ jobs:
         run: |
           for t in dns tls decode engine; do scripts/fuzz.sh "$t" 30; done
           test -z "$(find fuzz/artifacts -type f 2>/dev/null)" || { echo "fuzzer found crashes:"; find fuzz/artifacts -type f; exit 1; }
+
+  app:
+    # Flutter dashboard: analyze + widget tests in the pinned app container (dev/flutter/Containerfile).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build pinned app container
+        run: scripts/app.sh true
+
+      - name: dart format, flutter analyze, flutter test, linux build
+        run: |
+          scripts/app.sh bash -c 'flutter pub get --enforce-lockfile && dart format --line-length 110 --set-exit-if-changed lib test && flutter analyze && flutter test && flutter build linux --release'

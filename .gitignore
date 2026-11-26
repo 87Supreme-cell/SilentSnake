@@ -46,3 +46,8 @@ credentials*
 
 # Release output (scripts/release.sh)
 /dist/
+
+# App screenshots that show this machine's LAN/ULA addresses stay local (scripts/screenshot-app.sh)
+/docs/proof/screenshots/connections.png
+/docs/proof/screenshots/log.png
+/target/shot-xdg/

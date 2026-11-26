@@ -1,0 +1,19 @@
+name: silentsnake
+description: "SilentSnake dashboard: live view of the local REST API (127.0.0.1:8765)."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.14.0
+
+# SDK only. No hosted packages (dependencies.json: no new dependency without approval).
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

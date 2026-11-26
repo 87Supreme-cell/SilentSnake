@@ -148,6 +148,28 @@ func TestEngineSignalsRaiseRisk(t *testing.T) {
 	}
 }
 
+func TestLinkLocalICMPv6IsNotAnInboundConnection(t *testing.T) {
+	// Seen live 2026-11-26: router adverts / neighbour discovery scored +25 as "inbound".
+	for _, c := range []struct {
+		proto, src string
+		want       int
+	}{
+		{"icmpv6", "fe80::1367:267e:62ee:4396", 0},
+		{"udp", "fe80::1", 0},      // link-local (e.g. DHCPv6, mDNS)
+		{"udp", "ff02::fb", 0},     // multicast source is never a connection
+		{"icmp", "203.0.113.9", 0}, // ping in is not a session
+		{"tcp", "203.0.113.9", 25}, // a real inbound connection still counts
+		{"udp", "2001:db8::9", 25},
+	} {
+		f := &Flow{Proto: c.proto, Direction: "inbound",
+			Initiator: &Endpoint{IP: c.src, Port: 0}, Responder: &Endpoint{IP: "192.168.1.10", Port: 5353}}
+		scoreFlow(f)
+		if f.Risk != c.want {
+			t.Errorf("%s from %s: risk %d want %d (%v)", c.proto, c.src, f.Risk, c.want, f.Reasons)
+		}
+	}
+}
+
 func TestStoppedEngineIsReported(t *testing.T) {
 	st := NewState("any", fixedNow)
 	st.EngineFailed("cannot start capture engine")

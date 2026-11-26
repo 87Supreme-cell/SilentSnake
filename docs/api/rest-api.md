@@ -32,7 +32,7 @@ The score is a transparent heuristic over what stage A can see. It is a prompt t
 
 | Rule | Points |
 |---|---|
-| Inbound connection (another machine opened it) | +25 |
+| Inbound TCP/UDP connection from a routable peer (another machine opened it; ICMP and link-local/multicast peers such as IPv6 neighbour discovery don't count) | +25 |
 | Transit traffic (neither end is this machine) | +10 |
 | Unencrypted TCP service to a non-local peer: FTP 21, Telnet 23, HTTP 80, POP3 110, IMAP 143, LDAP 389 | +20 |
 | Outbound TCP to a port ≥ 1024 with no known service | +10 |
