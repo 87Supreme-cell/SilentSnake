@@ -206,12 +206,18 @@ fn dropped_warning(st: &StatsInfo) -> String {
     // u64 sum: two u32 counters near their limit must not overflow (ADV-0013).
     let dropped =
         u64::from(st.kernel_dropped.unwrap_or(0)) + u64::from(st.interface_dropped.unwrap_or(0));
-    if dropped > 0 {
-        format!(
+    let unprocessed = st.counters.packets_unprocessed_at_stop;
+    match (dropped > 0, unprocessed > 0) {
+        (true, false) => format!(
             " Warning: {dropped} packets were dropped before SilentSnake saw them, so this record is incomplete."
-        )
-    } else {
-        String::new()
+        ),
+        (false, true) => format!(
+            " Warning: {unprocessed} packets captured before the stop were not processed, so this record is incomplete."
+        ),
+        (true, true) => format!(
+            " Warning: {dropped} packets were dropped before SilentSnake saw them and {unprocessed} captured before the stop were not processed, so this record is incomplete."
+        ),
+        (false, false) => String::new(),
     }
 }
 
@@ -266,11 +272,35 @@ pub fn engine_stop(reason: StopReason, st: &StatsInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Counters;
 
     #[test]
     fn byte_units() {
         assert_eq!(bytes(999), "999 B");
         assert_eq!(bytes(3_200), "3.2 KB");
         assert_eq!(bytes(48_100_000), "48.1 MB");
+    }
+
+    #[test]
+    fn unprocessed_at_stop_marks_the_record_incomplete() {
+        // ADV-0032: a backlog left in the ring at stop is not a kernel drop, but it must still
+        // be reported as an incomplete record.
+        let mut st = StatsInfo {
+            counters: Counters::default(),
+            flows_active: 0,
+            kernel_received: Some(80_000),
+            kernel_dropped: Some(0),
+            interface_dropped: Some(0),
+        };
+        assert!(dropped_warning(&st).is_empty());
+        st.counters.packets_unprocessed_at_stop = 39_814;
+        let w = engine_stop(StopReason::Duration, &st);
+        assert!(w.contains("39814 packets captured before the stop were not processed"));
+        assert!(w.contains("incomplete"));
+        st.kernel_dropped = Some(5);
+        let w = dropped_warning(&st);
+        assert!(
+            w.contains("5 packets were dropped") && w.contains("39814 captured before the stop")
+        );
     }
 }

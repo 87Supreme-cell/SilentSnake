@@ -2,13 +2,14 @@
 
 #![deny(clippy::indexing_slicing)]
 
-use etherparse::{EtherType, NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{EtherType, LaxNetSlice, LaxSlicedPacket, LenSource, TransportSlice};
 use std::net::IpAddr;
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 pub const PROTO_ICMPV6: u8 = 58;
+const UDP_HEADER_LEN: usize = 8;
 
 /// Capture link types SilentSnake decodes (libpcap DLT_* / LINKTYPE_* values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,13 @@ pub struct Decoded<'a> {
     pub sport: u16,
     pub dport: u16,
     pub tcp: Option<TcpInfo>,
+    /// Captured transport payload (may be shorter than on the wire if `truncated`).
     pub payload: &'a [u8],
+    /// The packet was cut short by the snaplen; counts use the on-wire length regardless.
+    pub truncated: bool,
+    /// Whole UDP datagram whose length field is shorter than its IP payload: Linux trims and
+    /// delivers it, so it is decoded, but the bytes after `ulen` are a known evasion trick.
+    pub udp_trailing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,41 +83,56 @@ pub enum Outcome<'a> {
     NonIp,
     /// IP fragments: not reassembled in stage A, counted only.
     Fragment,
-    /// Headers that don't parse (truncated, corrupt or hostile).
+    /// Headers that don't parse (corrupt, hostile, or cut inside a header).
     Malformed,
     UnsupportedLink,
 }
 
-fn slice(link: LinkType, data: &[u8]) -> Option<Result<SlicedPacket<'_>, ()>> {
+/// Slices with etherparse's *lax* parser: a packet cut short by the snaplen (common for
+/// outgoing GSO super-packets) still yields its headers and the captured part of its payload,
+/// instead of failing as malformed (ADV-0002).
+fn slice(link: LinkType, data: &[u8]) -> Option<Result<LaxSlicedPacket<'_>, ()>> {
+    fn ether_type_at(data: &[u8], at: usize) -> Option<EtherType> {
+        let b = data.get(at..at + 2)?;
+        Some(EtherType(u16::from_be_bytes([*b.first()?, *b.get(1)?])))
+    }
     let r = match link {
-        LinkType::Ethernet => SlicedPacket::from_ethernet(data),
-        LinkType::LinuxSll => SlicedPacket::from_linux_sll(data),
-        LinkType::LinuxSll2 => {
-            // 20-byte header; the first two bytes are the EtherType of the payload.
-            let (Some(proto), Some(rest)) = (data.get(..2), data.get(20..)) else {
-                return Some(Err(()));
-            };
-            let et = u16::from_be_bytes([*proto.first()?, *proto.get(1)?]);
-            SlicedPacket::from_ether_type(EtherType(et), rest)
-        }
-        LinkType::Raw => SlicedPacket::from_ip(data),
+        LinkType::Ethernet => LaxSlicedPacket::from_ethernet(data).map_err(|_| ()),
+        // Linux cooked v1: 16-byte header, protocol (EtherType) in bytes 14..16.
+        LinkType::LinuxSll => match (ether_type_at(data, 14), data.get(16..)) {
+            (Some(et), Some(rest)) => Ok(LaxSlicedPacket::from_ether_type(et, rest)),
+            _ => Err(()),
+        },
+        // Linux cooked v2: 20-byte header, protocol (EtherType) in bytes 0..2.
+        LinkType::LinuxSll2 => match (ether_type_at(data, 0), data.get(20..)) {
+            (Some(et), Some(rest)) => Ok(LaxSlicedPacket::from_ether_type(et, rest)),
+            _ => Err(()),
+        },
+        LinkType::Raw => LaxSlicedPacket::from_ip(data).map_err(|_| ()),
         LinkType::Null => match data.get(4..) {
-            Some(rest) => SlicedPacket::from_ip(rest),
-            None => return Some(Err(())),
+            Some(rest) => LaxSlicedPacket::from_ip(rest).map_err(|_| ()),
+            None => Err(()),
         },
         LinkType::Unsupported(_) => return None,
     };
-    Some(r.map_err(|_| ()))
+    Some(r)
 }
 
-pub fn decode(link: LinkType, data: &[u8]) -> Outcome<'_> {
+/// `cut` is true when the capture truncated the packet (captured length < on-wire length).
+/// Only then are incomplete layers accepted. A packet that arrived whole but whose length
+/// fields lie, or whose headers stop parsing, is one the host's own stack would drop, so it is
+/// Malformed and creates no flow, DNS name or SNI (ADV-0025).
+pub fn decode(link: LinkType, data: &[u8], cut: bool) -> Outcome<'_> {
     let sliced = match slice(link, data) {
         None => return Outcome::UnsupportedLink,
         Some(Err(())) => return Outcome::Malformed,
         Some(Ok(s)) => s,
     };
+    if !cut && sliced.stop_err.is_some() {
+        return Outcome::Malformed;
+    }
     let (src, dst, ip_payload) = match &sliced.net {
-        Some(NetSlice::Ipv4(v4)) => {
+        Some(LaxNetSlice::Ipv4(v4)) => {
             let h = v4.header();
             (
                 IpAddr::V4(h.source_addr()),
@@ -118,7 +140,7 @@ pub fn decode(link: LinkType, data: &[u8]) -> Outcome<'_> {
                 v4.payload(),
             )
         }
-        Some(NetSlice::Ipv6(v6)) => {
+        Some(LaxNetSlice::Ipv6(v6)) => {
             let h = v6.header();
             (
                 IpAddr::V6(h.source_addr()),
@@ -126,12 +148,26 @@ pub fn decode(link: LinkType, data: &[u8]) -> Outcome<'_> {
                 v6.payload(),
             )
         }
-        Some(NetSlice::Arp(_)) | None => return Outcome::NonIp,
+        Some(LaxNetSlice::Arp(_)) | None => return Outcome::NonIp,
     };
     if ip_payload.fragmented {
         return Outcome::Fragment;
     }
+    if !cut {
+        // Whole packet: the IP header's own length field must have been usable. Lax parsing
+        // silently falls back to the captured length when it isn't (e.g. IPv4 total length
+        // smaller than the header), which the kernel would reject.
+        let expected = match &sliced.net {
+            Some(LaxNetSlice::Ipv4(_)) => LenSource::Ipv4HeaderTotalLen,
+            _ => LenSource::Ipv6HeaderPayloadLen,
+        };
+        if ip_payload.incomplete || ip_payload.len_source != expected {
+            return Outcome::Malformed;
+        }
+    }
     let proto = ip_payload.ip_number.0;
+    let truncated = ip_payload.incomplete;
+    let mut udp_trailing = false;
     let (sport, dport, tcp, payload): (u16, u16, Option<TcpInfo>, &[u8]) = match &sliced.transport {
         Some(TransportSlice::Tcp(t)) => (
             t.source_port(),
@@ -145,7 +181,21 @@ pub fn decode(link: LinkType, data: &[u8]) -> Outcome<'_> {
             }),
             t.payload(),
         ),
-        Some(TransportSlice::Udp(u)) => (u.source_port(), u.destination_port(), None, u.payload()),
+        // Match Linux `__udp4_lib_rcv` / `udpv6_rcv` (ADV-0025, ADV-0029): a UDP length below
+        // the header size is dropped, and so is a whole datagram claiming more than its IP
+        // payload. A shorter claim is trimmed to `ulen` and *delivered*, so it must decode
+        // (lax parsing already slices the payload to `ulen`), flagged as trailing bytes.
+        Some(TransportSlice::Udp(u)) => {
+            let ulen = usize::from(u.length());
+            let ip_len = ip_payload.payload.len();
+            if ulen < UDP_HEADER_LEN || (!cut && ulen > ip_len) {
+                return Outcome::Malformed;
+            }
+            udp_trailing = !cut && ulen < ip_len;
+            (u.source_port(), u.destination_port(), None, u.payload())
+        }
+        // A TCP/UDP header we couldn't read would make a bogus port-0 flow: count it instead.
+        None if proto == PROTO_TCP || proto == PROTO_UDP => return Outcome::Malformed,
         _ => (0, 0, None, &[]),
     };
     Outcome::Ip(Decoded {
@@ -156,6 +206,8 @@ pub fn decode(link: LinkType, data: &[u8]) -> Outcome<'_> {
         dport,
         tcp,
         payload,
+        truncated,
+        udp_trailing,
     })
 }
 

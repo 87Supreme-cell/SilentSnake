@@ -220,6 +220,11 @@ impl Engine {
         &self.counters
     }
 
+    /// Records packets that were captured before the stop but never processed (ADV-0032).
+    pub fn note_unprocessed_at_stop(&mut self, n: u64) {
+        self.counters.packets_unprocessed_at_stop += n;
+    }
+
     pub fn active_flows(&self) -> usize {
         self.flows
             .values()
@@ -269,8 +274,14 @@ impl Engine {
         if ts > self.latest {
             self.latest = ts;
         }
-        match decode::decode(link, data) {
-            Outcome::Ip(d) => self.handle_ip(ts, &d, u64::from(wire_len), out),
+        let cut = (data.len() as u64) < u64::from(wire_len);
+        match decode::decode(link, data, cut) {
+            Outcome::Ip(d) => {
+                if d.udp_trailing {
+                    self.counters.udp_trailing_bytes += 1;
+                }
+                self.handle_ip(ts, &d, u64::from(wire_len), out)
+            }
             Outcome::NonIp => self.counters.packets_non_ip += 1,
             Outcome::Fragment => self.counters.packets_fragmented += 1,
             Outcome::Malformed => self.counters.packets_undecoded += 1,
@@ -464,6 +475,7 @@ impl Engine {
                 &mut self.counters,
                 &mut self.tls_collecting,
                 self.cfg.max_tls_collecting,
+                d.truncated,
             )
         {
             if let Some(n) = &ch.server_name {
@@ -589,6 +601,7 @@ fn feed_tls(
     counters: &mut Counters,
     collecting: &mut usize,
     max_collecting: usize,
+    truncated: bool,
 ) -> Option<tls::ClientHello> {
     let seg_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
     match state {
@@ -637,8 +650,9 @@ fn feed_tls(
         return None;
     };
     match tls::parse_client_hello(buf) {
-        // Buffer full and still incomplete: it can never parse, so free the slot now.
-        Ok(None) if buf.len() >= MAX_TLS_BUFFER => {
+        // Buffer full, or bytes lost to the snaplen, and still incomplete: it can never
+        // parse, so free the slot now rather than guess across missing bytes.
+        Ok(None) if buf.len() >= MAX_TLS_BUFFER || truncated => {
             counters.tls_unparsed += 1;
             release_tls(state, collecting);
             None

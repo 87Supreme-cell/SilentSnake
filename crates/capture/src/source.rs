@@ -15,12 +15,24 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub const SNAPLEN: i32 = 262_144;
-pub const READ_TIMEOUT_MS: i32 = 250;
-pub const KERNEL_BUFFER_BYTES: i32 = 8 * 1024 * 1024;
+/// 18 KiB: a full TLS record (16 KiB + headers), so a single-segment ClientHello of any legal
+/// size keeps its SNI (ADV-0024). With TPACKET_V3 (see `run`) packets are packed into the ring
+/// at their captured length, so the snaplen no longer limits how many fit (ADV-0028). Longer
+/// packets are truncated, decoded laxly, and counted at their full on-the-wire length.
+pub const SNAPLEN: i32 = 18_432;
+/// TPACKET_V3 block retire timeout: a partly filled block is handed over after at most this
+/// long, which bounds the extra delivery latency on a quiet link.
+pub const READ_TIMEOUT_MS: i32 = 10;
+pub const KERNEL_BUFFER_BYTES: i32 = 32 * 1024 * 1024;
 const ADDR_REFRESH: Duration = Duration::from_secs(60);
 /// Sleep when no packet is waiting (non-blocking live capture): bounds added latency.
-const IDLE_SLEEP: Duration = Duration::from_millis(10);
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
+/// After a `--duration` stop: time to keep processing packets captured before the stop, then
+/// time to count (not process) any that are left (ADV-0032).
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+const SKIM_BUDGET: Duration = Duration::from_secs(1);
+/// One block-retire interval plus margin, so the last partly filled block is visible.
+const DRAIN_RETIRE_WAIT: Duration = Duration::from_millis(READ_TIMEOUT_MS as u64 + 5);
 pub const MAX_FILTER_LEN: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -120,12 +132,16 @@ pub fn run<W: Write>(cfg: &RunConfig, out: W) -> Result<StopReason, RunError> {
                 .map_err(|e| RunError::Open(e.to_string()))?
                 .snaplen(SNAPLEN)
                 .promisc(false)
-                .immediate_mode(true)
+                // Not immediate mode: on Linux, libpcap then uses TPACKET_V3, which packs
+                // packets into ring blocks by captured length. Immediate mode forces TPACKET_V2
+                // with one fixed snaplen-sized frame per packet, which overflowed on 20k-datagram
+                // bursts at an 18 KiB snaplen (ADV-0028). Latency is bounded by READ_TIMEOUT_MS.
+                .immediate_mode(false)
                 .timeout(READ_TIMEOUT_MS)
                 .buffer_size(KERNEL_BUFFER_BYTES)
                 .open()
                 .map_err(|e| RunError::Open(e.to_string()))?
-                // Non-blocking: with Linux TPACKET_V3 the read timeout only starts once a packet
+                // Non-blocking: with TPACKET_V3 the read timeout only starts once a packet
                 // arrives (pcap(3PCAP)), so a blocking read on a quiet interface never returns
                 // and --duration, idle expiry and stats would stall. We sleep IDLE_SLEEP instead.
                 .setnonblock()
@@ -243,6 +259,70 @@ fn pump<T: Activated + ?Sized, W: Write>(
         }
     };
 
+    // ADV-0032: a `--duration` stop must not discard what the ring already holds. TPACKET_V3
+    // keeps up to 32 MiB of packets (everything that arrived while we were behind) plus a
+    // block that retires only after READ_TIMEOUT_MS. Process every packet timestamped before
+    // the stop for up to DRAIN_BUDGET, then count (without processing) whatever is left, for up
+    // to SKIM_BUDGET, so an incomplete record always says so. `--count` stops are exact by
+    // definition and are not drained.
+    //
+    // ADV-0033: the kernel counters are read at the stop, so packets arriving during the drain
+    // don't inflate `kernel_received` (a packet already in the ring can no longer be dropped).
+    // The skim window starts when skimming starts, so a stdout write that blocked through the
+    // processing budget can't cut the count short. The boundary is never earlier than the
+    // newest packet already processed: a packet stamped after "now" proves the wall clock
+    // stepped back, and the backlog behind it belongs to this run.
+    let mut kernel_at_stop = None;
+    if live && reason == StopReason::Duration {
+        kernel_at_stop = kernel(&mut cap);
+        let stop = Ts::now().max(engine.latest());
+        let process_until = Instant::now() + DRAIN_BUDGET;
+        let mut skim_until: Option<Instant> = None;
+        let mut idle = 0u32;
+        let mut unprocessed: u64 = 0;
+        loop {
+            match cap.next_packet() {
+                Ok(p) => {
+                    idle = 0;
+                    let ts = Ts::new(p.header.ts.tv_sec, p.header.ts.tv_usec);
+                    if ts > stop {
+                        break; // arrived after the stop: not part of this run
+                    }
+                    let now = Instant::now();
+                    if now < process_until {
+                        engine.process(ts, link, p.data, p.header.len, &mut events);
+                    } else {
+                        unprocessed += 1;
+                        if now >= *skim_until.get_or_insert(now + SKIM_BUDGET) {
+                            break;
+                        }
+                    }
+                }
+                Err(pcap::Error::TimeoutExpired) => {
+                    // Empty twice, a block-retire interval apart: the partly filled block has
+                    // been handed over and read.
+                    idle += 1;
+                    if idle >= 2 {
+                        break;
+                    }
+                    std::thread::sleep(DRAIN_RETIRE_WAIT);
+                }
+                Err(pcap::Error::NoMorePackets) => break,
+                Err(e) => return Err(RunError::Capture(e.to_string())),
+            }
+            if !events.is_empty() {
+                match writer.write(&mut events) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                        return Ok(StopReason::OutputClosed);
+                    }
+                    Err(e) => return Err(RunError::Output(e)),
+                }
+            }
+        }
+        engine.note_unprocessed_at_stop(unprocessed);
+    }
+
     let end_ts = if live { Ts::now() } else { engine.latest() };
     engine.flush(
         if live {
@@ -252,7 +332,7 @@ fn pump<T: Activated + ?Sized, W: Write>(
         },
         &mut events,
     );
-    let stats = engine.stats(kernel(&mut cap));
+    let stats = engine.stats(kernel_at_stop.or_else(|| kernel(&mut cap)));
     events.push(Event {
         ts: end_ts,
         summary: summary::engine_stop(reason, &stats),

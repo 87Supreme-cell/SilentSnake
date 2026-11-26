@@ -433,3 +433,191 @@ fn hello_followed_by_bulk_data_in_one_segment_keeps_sni() {
     assert!(ev.iter().any(|b| matches!(b, EventBody::TlsClientHello { server_name: Some(n), .. } if n == "bulk.example")));
     assert_eq!(e.tls_buffers_in_use(), 0);
 }
+
+// ---- ADV-0002: smaller snaplen means truncated packets; they must still count ----------
+
+fn feed_cut(e: &mut Engine, link: LinkType, pkt: &[u8], keep: usize) -> Vec<EventBody> {
+    let mut out = Vec::new();
+    e.process(
+        Ts::new(5, 0),
+        link,
+        &pkt[..keep.min(pkt.len())],
+        pkt.len() as u32,
+        &mut out,
+    );
+    out.into_iter().map(|ev| ev.body).collect()
+}
+
+#[test]
+fn truncated_packets_still_make_flows_and_count_full_wire_bytes() {
+    let mut e = engine();
+    let pkt = tcp_packet(ME, SRV, 40_000, 443, 1, Flags::Ack, &[0x17; 6000]);
+    let ev = feed_cut(&mut e, LinkType::Raw, &pkt, 1000);
+    assert!(matches!(&ev[0], EventBody::FlowStart { .. }), "{ev:?}");
+    assert_eq!(e.counters().packets_undecoded, 0);
+    let mut out = Vec::new();
+    e.flush(EndReason::CaptureEnd, &mut out);
+    let EventBody::FlowEnd {
+        initiator_bytes, ..
+    } = &out[0].body
+    else {
+        panic!()
+    };
+    assert_eq!(
+        *initiator_bytes,
+        pkt.len() as u64,
+        "bytes must be the on-wire length"
+    );
+}
+
+#[test]
+fn truncated_client_hello_is_unparsed_not_guessed() {
+    let mut e = engine();
+    let hello = tls::tests::client_hello(Some("cut.example"), false, 3000, 16384);
+    let pkt = tcp_packet(ME, SRV, 40_001, 443, 1, Flags::Ack, &hello);
+    let ev = feed_cut(&mut e, LinkType::Raw, &pkt, 1500);
+    assert!(
+        !ev.iter()
+            .any(|b| matches!(b, EventBody::TlsClientHello { .. }))
+    );
+    assert_eq!(e.counters().tls_unparsed, 1);
+    assert_eq!(e.tls_buffers_in_use(), 0);
+    // A hello that fits inside the captured part still parses from a truncated packet.
+    let small = tls::tests::client_hello(Some("fits.example"), false, 64, 16384);
+    let mut payload = small.clone();
+    payload.extend_from_slice(&[0x17; 9000]);
+    let pkt = tcp_packet(ME, SRV, 40_002, 443, 1, Flags::Ack, &payload);
+    let ev = feed_cut(&mut e, LinkType::Raw, &pkt, 8192);
+    assert!(ev.iter().any(|b| matches!(b, EventBody::TlsClientHello { server_name: Some(n), .. } if n == "fits.example")));
+}
+
+#[test]
+fn linux_sll_v1_and_v2_still_decode() {
+    let ip = udp_packet(ME, SRV, 5000, 53, b"x");
+    let mut sll = vec![0u8; 14];
+    sll.extend_from_slice(&0x0800u16.to_be_bytes());
+    sll.extend_from_slice(&ip);
+    assert!(matches!(
+        crate::decode::decode(LinkType::LinuxSll, &sll, false),
+        crate::decode::Outcome::Ip(_)
+    ));
+    let mut sll2 = 0x0800u16.to_be_bytes().to_vec();
+    sll2.extend_from_slice(&[0u8; 18]);
+    sll2.extend_from_slice(&ip);
+    assert!(matches!(
+        crate::decode::decode(LinkType::LinuxSll2, &sll2, false),
+        crate::decode::Outcome::Ip(_)
+    ));
+    assert!(matches!(
+        crate::decode::decode(LinkType::LinuxSll, &sll[..10], true),
+        crate::decode::Outcome::Malformed
+    ));
+}
+
+// ---- ADV-0025: whole packets whose headers lie are malformed, not phantom traffic --------
+
+#[test]
+fn whole_packets_with_lying_lengths_are_malformed() {
+    use crate::decode::{Outcome, decode};
+    // IPv4 total length smaller than its own header.
+    let mut v4 = tcp_packet(ME, SRV, 40_000, 443, 1, Flags::Syn, &[]);
+    v4[2..4].copy_from_slice(&10u16.to_be_bytes());
+    assert!(matches!(
+        decode(LinkType::Raw, &v4, false),
+        Outcome::Malformed
+    ));
+    // UDP length fields the kernel drops (ADV-0029: only these): longer than the IP payload,
+    // or shorter than the UDP header itself (also when the capture cut the packet).
+    let answer = dns::tests::build(5, "evil.example", true, 0, &[(1, &SRV, 300)]);
+    let good = udp_packet([1, 1, 1, 1], ME, 53, 50000, &answer);
+    let ulen = u16::from_be_bytes([good[24], good[25]]);
+    for (bad, cut) in [(ulen + 7, false), (7, false), (0, false), (4, true)] {
+        let mut p = good.clone();
+        p[24..26].copy_from_slice(&bad.to_be_bytes());
+        let keep = if cut { p.len() - 4 } else { p.len() };
+        assert!(
+            matches!(decode(LinkType::Raw, &p[..keep], cut), Outcome::Malformed),
+            "ulen {bad} cut {cut}"
+        );
+    }
+    let mut udp = good.clone();
+    udp[24..26].copy_from_slice(&(ulen + 7).to_be_bytes());
+    // Through the engine: no flow, no DNS name learned, counted as undecoded.
+    let mut e = engine();
+    assert!(feed(&mut e, 1, &udp).is_empty());
+    assert_eq!(e.counters().packets_undecoded, 1);
+    // The same packet genuinely cut by the capture is still accepted.
+    assert!(matches!(
+        decode(LinkType::Raw, &good[..good.len() - 4], true),
+        Outcome::Ip(_)
+    ));
+}
+
+// ---- ADV-0029: Linux trims a short UDP length and delivers it, so it must stay visible ----
+
+#[test]
+fn udp_length_shorter_than_ip_payload_is_trimmed_and_flagged() {
+    use crate::decode::{Outcome, decode};
+    let answer = dns::tests::build(9, "hidden.example", true, 0, &[(1, &SRV, 300)]);
+    let mut body = answer.clone();
+    body.extend_from_slice(&[0xAA; 3_000]);
+    let ulen = u16::try_from(8 + answer.len()).unwrap();
+
+    // IPv4: the IP total length covers the junk, the UDP length only the DNS message.
+    let mut v4 = udp_packet([1, 1, 1, 1], ME, 53, 50000, &body);
+    v4[24..26].copy_from_slice(&ulen.to_be_bytes());
+    v4[26..28].copy_from_slice(&[0, 0]);
+    match decode(LinkType::Raw, &v4, false) {
+        Outcome::Ip(d) => {
+            assert!(d.udp_trailing);
+            assert_eq!(
+                d.payload,
+                &answer[..],
+                "payload is what the kernel delivers"
+            );
+        }
+        other => panic!("trimmed IPv4 UDP must decode, got {other:?}"),
+    }
+    let mut e = engine();
+    let ev = feed(&mut e, 1, &v4);
+    assert!(ev.iter().any(|b| matches!(b, EventBody::FlowStart { .. })));
+    assert!(
+        ev.iter()
+            .any(|b| matches!(b, EventBody::Dns { message, .. } if message.answers[0].data.as_deref() == Some("93.184.216.34")))
+    );
+    assert_eq!(e.counters().flows_started, 1);
+    assert_eq!(e.counters().packets_undecoded, 0);
+    assert_eq!(e.counters().udp_trailing_bytes, 1);
+
+    // IPv6: same shape (UDP length at 40 + 4).
+    let (a, b) = (
+        [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    );
+    let mut v6 = Vec::new();
+    PacketBuilder::ipv6(a, b, 64)
+        .udp(40_000, 5_000)
+        .write(&mut v6, &body)
+        .unwrap();
+    v6[44..46].copy_from_slice(&ulen.to_be_bytes());
+    assert!(matches!(
+        decode(LinkType::Raw, &v6, false),
+        Outcome::Ip(d) if d.udp_trailing && d.payload.len() == answer.len()
+    ));
+
+    // An exact UDP length (normal traffic) is never flagged, and neither is a cut packet.
+    let normal = udp_packet([1, 1, 1, 1], ME, 53, 50000, &answer);
+    assert!(matches!(decode(LinkType::Raw, &normal, false), Outcome::Ip(d) if !d.udp_trailing));
+    assert!(matches!(
+        decode(LinkType::Raw, &v4[..v4.len() - 100], true),
+        Outcome::Ip(d) if !d.udp_trailing
+    ));
+}
+
+#[test]
+fn snaplen_holds_a_full_tls_record_with_headers() {
+    // ADV-0024: a single-segment ClientHello of any legal size must be captured whole.
+    // Worst-case headers: Linux SLL2 (20) + IPv6 (40) + TCP with options (60) + TLS record (5).
+    let needed = tls::MAX_RECORD + 5 + 20 + 40 + 60;
+    assert!(usize::try_from(crate::source::SNAPLEN).unwrap() >= needed);
+}

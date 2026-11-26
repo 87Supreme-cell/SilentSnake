@@ -13,5 +13,5 @@ fuzz_target!(|data: &[u8]| {
         4 => LinkType::Null,
         _ => LinkType::Unsupported(i32::from(sel)),
     };
-    let _ = decode::decode(link, pkt);
+    let _ = decode::decode(link, pkt, sel & 0x80 != 0);
 });

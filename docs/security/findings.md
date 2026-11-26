@@ -10,7 +10,7 @@ A milestone is **blocked** while any `critical` or `high` finding is `open`.
 | ID | Severity | Title | Milestone | Found | Status |
 |---|---|---|---|---|---|
 | ADV-0001 | high | Privilege guard checks only `CapEff`: extra permitted capabilities pass | capture stage A | 2026-11-25 | fixed (2026-11-25) |
-| ADV-0002 | medium | Capture ring overflows on small bursts (10 ms idle sleep + 256 KiB snaplen): 93-97% loss on a 1000-packet burst | capture stage A | 2026-11-25 | open |
+| ADV-0002 | medium | Capture ring overflows on small bursts (10 ms idle sleep + 256 KiB snaplen): 93-97% loss on a 1000-packet burst | capture stage A | 2026-11-25 | fixed (2026-11-25) |
 | ADV-0003 | medium | One spoofed or out-of-window TCP RST ends tracking: later bytes and the SNI disappear | capture stage A | 2026-11-25 | open |
 | ADV-0004 | medium | TLS SNI evasion: buffer-slot exhaustion, and out-of-order first segment dropped without being counted | capture stage A | 2026-11-25 | open |
 | ADV-0005 | medium | DNS-derived `server_name` can be poisoned by unsolicited DNS/mDNS/LLMNR answers | capture stage A | 2026-11-25 | open |
@@ -32,6 +32,17 @@ A milestone is **blocked** while any `critical` or `high` finding is `open`.
 | ADV-0021 | medium | ADV-0015 fix side effect: a ClientHello plus more data in one large segment loses its SNI | capture stage A | 2026-11-25 | fixed (2026-11-25) |
 | ADV-0022 | low | Privilege guard ignores supplementary group 0 (`Groups:`) | capture stage A | 2026-11-25 | fixed (2026-11-25) |
 | ADV-0023 | medium | SNI lost when the ClientHello is fragmented into many tiny TLS records | capture stage A | 2026-11-25 | open |
+| ADV-0024 | medium | 8 KiB snaplen: a ClientHello over 8 KiB in one segment loses its SNI; large DNS over loopback is cut | capture stage A | 2026-11-25 | fixed (2026-11-25) |
+| ADV-0025 | low | Lax decoding accepts packets the kernel discards (lying IPv4/UDP lengths, bad IPv6 extension headers): phantom flows and DNS | capture stage A | 2026-11-25 | fixed (2026-11-25) |
+| ADV-0026 | low | Capacity limit: sustained churn of new flows above ~60k/s, or a slow consumer, causes kernel drops (reported) | capture stage A | 2026-11-25 | open |
+| ADV-0028 | medium | 18 KiB snaplen cuts ring headroom: 20k-datagram bursts and ~400k/s sustained load drop again | capture stage A | 2026-11-25 | fixed (2026-11-26) |
+| ADV-0029 | medium | Whole UDP datagrams whose length field is shorter than the IP payload are Malformed, but Linux trims and delivers them (evasion) | capture stage A | 2026-11-25 | fixed (2026-11-26) |
+| ADV-0030 | low | Cut packets: UDP length checked against captured bytes, not the IP header length (phantom flows from kernel-dropped datagrams; `udp_trailing_bytes` evaded) | capture stage A | 2026-11-26 | open |
+| ADV-0031 | low | UDP checksums ignored: a DNS answer the kernel drops for a bad checksum is parsed and learned (phantom DNS) | capture stage A | 2026-11-26 | open |
+| ADV-0032 | medium | TPACKET_V3 + no drain at stop: packets already in the ring at `--duration` stop are discarded unprocessed and not counted as dropped (silent loss, no warning) | capture stage A | 2026-11-26 | fixed (2026-11-26) |
+| ADV-0033 | low | `packets_unprocessed_at_stop` under-counts when a blocked stdout write outlasts the drain deadlines (or the clock steps back); shutdown unbounded while the consumer stalls | capture stage A | 2026-11-26 | open (fix in tree 2026-11-26, awaiting re-test) |
+
+**ADV-0027 is not assigned.** The number was skipped when re-test 4 (2026-11-25) filed ADV-0028 and ADV-0029. It appears in no file and nowhere in git history (checked in re-test 5, 2026-11-26). It stays unused and must not be reused.
 
 ## Findings
 
@@ -91,6 +102,9 @@ Template for each entry (copy below this line):
 - **Suggested fix:** Wait on the pcap selectable fd (poll with a timeout) instead of sleeping, and/or size the ring by frames (smaller snaplen for metadata capture, larger buffer). Add a burst test to the smoke suite that asserts `kernel_dropped == 0` at a stated rate. Builder decides.
 - **Status log:**
   - 2026-11-25 open
+  - 2026-11-25 fixed (re-test 3 @ f414838 + uncommitted working tree, report pentest-2026-11-25.md "Re-test 3"): snaplen 8 KiB, 32 MiB ring, 1 ms idle sleep. Live on lo (release build), with tight Python send loops: bursts of 100 / 1,000 / 5,000 / 20,000 / 100,000 datagrams (up to 400,000 kernel-counted packets) gave 0 kernel drops. Sustained single-flow load at 50k / 150k / ~375k datagrams/s for 8 s gave 0 drops (up to 5,997,304 packets seen). The original repro (a 100-datagram burst lost 68%) now loses 0%. Smoke check 1b passes. Residuals, filed separately: the 8 KiB truncation loses SNI for a ClientHello over 8 KiB in one segment (ADV-0024); lax decoding accepts packets the kernel would discard (ADV-0025); sustained churn of new flows above ~60k/s, or a slow consumer, still drops, honestly reported (ADV-0026). Idle cost is 9 CPU ticks per 10 s (about 0.9% of one core) and ~1,000 wakeups/s; `poll()` is the planned next step (ADR-0001).
+  - 2026-11-25 re-test 4 @ f414838 + working tree (snaplen 18 KiB, 32 MiB ring, 1 ms): partly regressed. Python tight-loop bursts of 100 / 1,000 / 5,000 datagrams still give 0 drops (the original 100-packet defect stays fixed). But 20,000-datagram bursts now drop 840 and 1,259 of 80,000 (two runs), a 100,000 burst drops 560 of 400,000, and sustained ~400k datagrams/s drops 45,990 of 12,210,180. All of these were 0 at 8 KiB in re-test 3. Smoke check 1b (bash, 5,000) still passes. The regression is tracked as ADV-0028; the status stays fixed for the defect as filed.
+  - 2026-11-26 re-test 5 (TPACKET_V3, report pentest-2026-11-25.md "Re-test 5"): still fixed. Independent C harness, release build, lo: bursts of 20,000 (×3) and 100,000 (×2) gave 0 drops; tight sustained load at ~546k datagrams/s for 8 s gave 0 of 17.5M (×2); paced 50k/150k/s gave 0. On `-i any`: 20k burst and tight sustained load gave 0. A side effect of the fix is tracked as ADV-0032.
 
 ### ADV-0003: One spoofed or out-of-window TCP RST ends tracking: later bytes and the SNI disappear
 - **Severity:** medium
@@ -268,6 +282,8 @@ Template for each entry (copy below this line):
 - **Suggested fix:** Run the release binary; add a burst step that asserts `kernel_dropped == 0`, a SIGTERM step that asserts `engine_stop`, and a permitted-only capability step (needs file caps, so a manual step or a privileged CI runner). Builder decides.
 - **Status log:**
   - 2026-11-25 open
+  - 2026-11-26 re-test 5: still open, partly addressed. The script now builds and runs the release binary, and check 1b (three tight 20,000-datagram perl bursts, `kernel_dropped == 0`) really gates ADV-0028: it failed the old V2 build 3 of 3 runs (6,823 / 10,643 / 11,176 of 240,000 dropped) and passed the new build 2 of 2. Still missing: a SIGTERM/`engine_stop` step, a permitted-only capability step, and an assertion that the burst was *processed* (`packets_seen`). Without that last check, 1b passes even when the engine stalls and the V3 ring silently swallows the burst (ADV-0032).
+  - 2026-11-26 re-test 6: still open. Check 1b now also asserts that the burst was processed (`packets_seen >= kernel_received/2`, `packets_unprocessed_at_stop == 0`, and fails if either field is missing). It fails the re-test 5 build (missing fields) and the V2 build (22,232 dropped), and passes the new build 2/2 (`120000 processed`). Still missing: a SIGTERM/`engine_stop` step and a permitted-only capability step.
 
 ### ADV-0017: ADR claims about memory safety and the supply chain are overstated; system libpcap is outside the audit gates
 - **Severity:** low
@@ -314,6 +330,7 @@ Template for each entry (copy below this line):
 - **Suggested fix:** Ronin approves a dated nightly pin; add fuzz targets for `dns::parse`, `tls::parse_client_hello`, `decode::decode` and `Engine::process`, plus a libpcap-file harness under ASan. Must be done before the first release.
 - **Status log:**
   - 2026-11-25 open
+  - 2026-11-26 observation in re-test 5 (no full re-test): cargo-fuzz now runs with the pinned nightly (`scripts/fuzz.sh`, targets dns/tls/decode/engine). `scripts/fuzz.sh decode 180`: 44,059,250 runs, no crash, no artifact. The status stays open until a dedicated re-test covers all targets, CI wiring and the libpcap/ASan harness.
 
 ### ADV-0021: ADV-0015 fix side effect: a ClientHello plus more data in one large segment loses its SNI
 - **Severity:** medium
@@ -352,3 +369,155 @@ Template for each entry (copy below this line):
 - **Suggested fix:** Bound the *reassembled handshake* (`MAX_HANDSHAKE`), and strip record headers as segments arrive (store only handshake bytes), instead of bounding raw stream bytes. Alternatively, flag `tls_record_fragmentation` as an anomaly on the flow so the evasion is visible per flow. Builder decides.
 - **Status log:**
   - 2026-11-25 open
+
+### ADV-0024: 8 KiB snaplen: a ClientHello over 8 KiB in one segment loses its SNI; large DNS over loopback is cut
+- **Severity:** medium
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0002 fix)
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 3")
+- **Violates:** dependencies.json `capture_integration_roadmap` stage A ("TLS SNI"); docs/controls.md "Capture completeness is visible".
+- **NIST SP 800-53:** SI-4, AU-3
+- **Reproduce:** `source.rs` `SNAPLEN = 8192`. A ClientHello whose handshake is larger than ~8 KiB, sent in one TCP segment (one write on loopback, or one TSO super-segment outbound), is cut by the kernel. `feed_tls` then sees `truncated` with an incomplete hello and counts `tls_unparsed`. The server receives the full hello, so the connection works while SilentSnake records no SNI. Before the fix the same hello was parsed (snaplen 256 KiB, buffer 17 KiB). Large but legitimate hellos exist (post-quantum key shares plus multi-KB PSK tickets), and a sender can pad on purpose. DNS sent over loopback (for example via the systemd-resolved stub on 127.0.0.53, MTU 65536, no fragmentation) is also cut at 8 KiB. If the cut falls inside the first 64 answers, the whole message becomes a `dns_parse_error` and no names are learned.
+- **Evidence:** Live on lo, rootless container, NET_RAW only: `t1-hello-plus-early.example` (small hello + 16 KB early data) **kept** its SNI; `t3-small.example` kept its SNI; `t2-9k-hello-one-segment.example` (9 KB pad, one segment) had **no SNI**; totals `tls_client_hellos 2`, `tls_unparsed 1`, `kernel_dropped 0`. A 9,629-byte DNS response with 600 answers still parsed, because the 64-answer cap was reached before the cut.
+- **Suggested fix:** Keep the 8 KiB default ring sizing, but make the ClientHello path robust. For example, raise the snaplen to cover `MAX_HANDSHAKE + headers` (~17 KiB) and size the ring by frames to keep the ADV-0002 margin, or use a BPF-based dynamic snaplen (full length for TCP payloads starting `16 03`, and UDP 53/5353/5355). At minimum, add `sni_unavailable: truncated` to the flow so the loss is visible per flow. Builder decides.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-25 fixed (re-test 4 @ f414838 + working tree): SNAPLEN 18,432. Live on lo, single-write ClientHellos with 32 / 9,000 / 12,000 / 16,000 / 16,200-byte pads (the last two span two TLS records): all 5 SNIs recorded; `tls_client_hellos 5`, `tls_unparsed 0`. `snaplen_holds_a_full_tls_record_with_headers` passes. Cost: reduced ring headroom (ADV-0028).
+  - 2026-11-26 re-test 5 (TPACKET_V3): still fixed. Live on lo, single-write ClientHellos with pads of 32 / 9,000 / 12,000 / 16,000 / 16,200 recorded all 5 SNIs; `tls_client_hellos 5`, `tls_unparsed 0`, `kernel_dropped 0`, `packets_undecoded 0`.
+
+### ADV-0025: Lax decoding accepts packets the kernel discards, so phantom flows and DNS appear
+- **Severity:** low
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0002 fix)
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 3")
+- **Violates:** docs/api/capture-events.md (`packets_undecoded` = headers that don't parse); dependencies.json `threat_model` (integrity of what the analyst and risk scoring see).
+- **NIST SP 800-53:** SI-10, SI-4
+- **Reproduce:** Crafted pcaps through the release binary (`-r`):
+  - (a) IPv4 `total_length = 10` (smaller than the header) produces a `tcp` flow; strict parsing rejected this, and Linux `ip_rcv` drops it.
+  - (b) UDP length 4000 on a 26-byte payload produces a `dns` message that is parsed and can be learned; the kernel drops it.
+  - (c) IPv6 with a destination-options header whose length runs past the packet produces a flow `proto ip-proto-60`, port 0 (the TCP inside is hidden).
+  - (d) IPv4 IHL 15 on a 40-byte frame is counted as `packets_non_ip` instead of `packets_undecoded`.
+  - (e) IPv4 `total_length = 60000` on a small frame is marked `truncated` and frees a TLS slot (`tls_unparsed 1`).
+
+  So a local sender with CAP_NET_RAW, or an on-path one, can inject events from packets that the host itself never accepts. That stealthily drives ADV-0005 (cache poisoning the host never sees) and ADV-0003/0004-style SNI suppression. On live capture, bytes still use the real frame length.
+- **Evidence:** `l2 ... "proto":"tcp" ... "packets_undecoded":0`; `l4 ... "dns_messages":1 "dns_parse_errors":0`; `l7 ... "proto":"ip-proto-60","initiator":{"ip":"fd00::1","port":0}`; `l5 ... "flows_started":0 "packets_undecoded":0`; `l1 ... "tls_unparsed":1`. No panics: a further 3,000 mutated pcaps (Ethernet, SLL v1, SLL v2 seeds) gave exit codes 0/1 only.
+- **Suggested fix:** Accept "incomplete" only when the capture really was cut (`caplen < len` from the pcap header); otherwise use strict parsing, or check `ihl*4 <= total_length`, `udp.len <= ip payload`, and that the IPv6 extension chain is complete. Count every rejection as `packets_undecoded`. Builder decides.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-25 fixed (re-test 4 @ f414838 + working tree): `decode()` takes `cut`. The re-test 3 cases (IPv4 total length 60000 and 10, UDP length 4000 on a DNS payload, IHL 15 short, IPv6 bad destination options) are now all `packets_undecoded 1` with no flow, DNS or TLS state. Legitimate traffic is not rejected: Ethernet padding (UDP and TCP), IPv4 options, 802.1Q VLAN, IPv6 hop-by-hop, destination options, routing type 0 and atomic fragment headers all decode. Live on `-i lo` and `-i any`, a UDP GSO super-packet (9,642 B), TCP bulk with GSO, IPv4/IPv6 UDP and ICMP all give `packets_undecoded 0`. Residual (accepted by design, noted): lax handling still applies whenever captured < wire length. In `--read` files the attacker sets that header (a forged wire length re-enables the UDP-length lie, l8: `dns_messages 1`). Live, it needs a frame over 18 KiB, which only loopback with a local CAP_NET_RAW sender can produce. Over-strictness in the new UDP check: new ADV-0029.
+  - 2026-11-26 re-test 5 (after the ADV-0029 change): still fixed for whole packets. IPv4 total length 10 / 60,000, UDP length 4,000 over DNS, IPv6 ulen > payload and ulen 0 to 7 are all `packets_undecoded`, with no flow or DNS, and live probes match the kernel case by case. The two remaining "host drops it, SilentSnake records it" paths are filed separately: cut packets checked against the captured length rather than the IP length (ADV-0030), and bad UDP checksums (ADV-0031).
+
+### ADV-0026: Capacity limit: sustained churn of new flows above ~60k/s, or a slow consumer, causes kernel drops
+- **Severity:** low
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0002 fix)
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 3")
+- **Violates:** dependencies.json `threat_model` (availability of monitoring); docs/decisions/0001 (no line-rate claim, consistent with these numbers).
+- **NIST SP 800-53:** SC-5, SI-4, AU-5
+- **Reproduce:** Raw IPv4/UDP with a new 5-tuple per packet (rotating 127/8 sources, loopback only), each drawing an ICMP reply, run for 6 s. Separately, the same 20k/s churn with stdout read at ~1 MB/s.
+- **Evidence:**
+
+  | Load | Result |
+  |---|---|
+  | 20k new flows/s | 0 drops (239,998 seen) |
+  | 60k new flows/s | 11,482 of 1,439,996 dropped (0.8%) |
+  | 150k new flows/s | 1,481,886 of 3,599,996 dropped (41%) |
+  | 20k/s into a slow reader | 438,357 of 479,996 dropped (91%); event output back-pressures the capture loop |
+
+  All drops were reported in `kernel_dropped` and the summary. Single-flow load was not affected (0 drops at ~375k datagrams/s). A spoofed-source flood of ~60k packets/s (~30 Mbit/s of minimum-size packets) starts to blind the monitor.
+- **Suggested fix:** Decouple output from capture (a bounded queue with an explicit `events_dropped` counter, so packet capture never stalls on the consumer), cheapen flow_start/flow_end under churn (for example aggregate or sample single-packet flows and report the count), and document a measured capacity figure. Make the future log store's ingest rate a design requirement. Builder decides.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-26 re-test 5 (TPACKET_V3): still open, improved. New-flow churn at 20k/s and 60k/s for 6 s gave 0 drops (×2 each; V2 at 18 KiB: 319-2,250 and 280,725-302,229). Churn at 150k/s still drops 1,125,881 / 1,125,243 of 3,599,996 (31%; V2: 51-52%). A ~1 MB/s reader at 20k/s churn: 359,712 of 479,996 reported dropped, and only 21,270 of ~240,000 deliverable packets processed. The rest were in the ring at stop and were discarded without being reported (ADV-0032).
+
+### ADV-0028: 18 KiB snaplen cuts ring headroom: 20k-datagram bursts and ~400k/s sustained load drop again
+- **Severity:** medium
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0024 fix)
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 4")
+- **Violates:** docs/controls.md "Monitoring survives traffic bursts (no kernel ring overflow)"; CLAUDE.md §5 item 2.
+- **NIST SP 800-53:** SI-4, SC-5, AU-5
+- **Reproduce:** Release binary, `-i lo`, rootless container with NET_RAW only, Python tight `sendto` loops (re-test 3 harness, unchanged). Raising SNAPLEN from 8,192 to 18,432 with the same 32 MiB ring cuts the number of ring frames to about 2/5.
+- **Evidence:**
+
+  | Load | 8 KiB (re-test 3) | 18 KiB (re-test 4) |
+  |---|---|---|
+  | burst 20,000 | 0 drops | 840 and 1,259 of 80,000 dropped |
+  | burst 100,000 | 0 drops | 560 of 400,000 dropped |
+  | sustained ~400k/s × 8 s | 0 drops | 45,990 of 12,210,180 dropped |
+  | new-flow churn 60k/s × 6 s | 11,482 dropped (0.8%) | 229,229 of 1,439,996 dropped (16%) |
+
+  Unchanged at 18 KiB: bursts of 100 to 5,000, sustained 50k and 150k/s, and 8 KB datagrams at 20k and 60k/s all show 0 drops. Smoke check 1b passes, but its bash loop sends too slowly to reach this regime. All drops are reported honestly.
+- **Suggested fix:** Grow the ring with the snaplen (for example 64 to 128 MiB, keeping the frame count of the 8 KiB design), or use a dynamic snaplen (full length only for TLS-looking TCP payloads and DNS ports via BPF), or move to `poll()`. Make smoke check 1b use a tight sender (or a fixed-rate one) so this regime is gated. Builder decides; ring size is a memory trade-off for Ronin.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-26 fix proposed (builder; Ronin chose option D; needs adversary re-test): root cause is libpcap immediate mode, which forces TPACKET_V2 (one fixed snaplen-sized frame per packet). Immediate mode off gives TPACKET_V3 (packets packed by captured length), with a block timeout of 250→10 ms; ring stays 32 MiB, snaplen stays 18 KiB. Rebuilt harness (`target/adv0028/send.py`, not committed), 2 runs each: 20k burst, 100k burst, ~450k/s sustained for 8 s and 60k/s churn for 6 s all gave **0 drops** (old build: 1,059–1,454 / 21–4,102 / 2,011–15,071 / 279k–290k). Comparison ring sizes on V2: 64 MiB still dropped on churn (44k–54k) and once sustained (153); 128 MiB dropped 935 on churn once. Smoke check 1b now sends three tight 20k bursts from perl; it fails the old build 4 of 4 runs and passes the new one 4 of 4. Trade-off: up to ~10 ms extra event latency on a quiet link.
+  - 2026-11-26 fixed (re-test 5, report pentest-2026-11-25.md "Re-test 5"): I verified this independently with my own C harness (not the builder's `send.py`). The release build from the tree (sha256 `5ab5aea6…cc89`, identical to `bin-D`) ran on lo in a NET_RAW-only container. Bursts of 20,000 ×3 and 100,000 ×2, tight sustained load at ~546k datagrams/s ×2, and churn at 20k and 60k new flows/s ×2 each all gave **0 drops**. The old V2 build (`bin-A`) in the same harness dropped 745–8,669 / 32,410–33,319 / 565,766–1,008,920 / 319–2,250 / 280,725–302,229. `-i any` (20k burst, tight sustained, IPv6 burst) gave 0 drops. V3 stats are accurate while the engine keeps up (`packets_seen` = `kernel_received`/2 exactly on lo). Smoke 1b gates the regression: it fails the old build 3/3 and passes the new build 2/2. Cost, measured: quiet-link event latency median 4.0 ms, p90 10.7 ms, max 11.3 ms (V2: 0.9 / 1.2 / 1.4 ms); idle CPU unchanged (~1% of a core, ~910 wakeups/s); SNI of single-segment ClientHellos up to 16,200-byte pads still captured (ADV-0024). New side effect: packets already in the much larger effective ring at `--duration` stop are discarded unprocessed and unreported (ADV-0032, medium).
+
+### ADV-0029: Whole UDP datagrams whose length field is shorter than the IP payload are Malformed, but Linux trims and delivers them
+- **Severity:** medium
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0025 fix)
+- **Found:** 2026-11-25 (report: pentest-2026-11-25.md, "Re-test 4")
+- **Violates:** dependencies.json `capture_integration_roadmap` stage A ("flows"); docs/controls.md "Capture completeness is visible".
+- **NIST SP 800-53:** SI-4, AU-3
+- **Reproduce:** `decode.rs` (whole packets) requires `u.length() == ip_payload.payload.len()`. Linux `__udp4_lib_rcv` and `udpv6_rcv` drop only `ulen > skb->len`; when `ulen < skb->len` they `pskb_trim_rcsum` to `ulen` and deliver the datagram. A sender can therefore make any UDP traffic (DNS, QUIC, custom C2) invisible to SilentSnake by appending junk after a correct, shorter UDP length. Live: a raw IPv4/UDP datagram (via IP_HDRINCL, so the kernel sets a correct IP total length) with UDP length 13 and 3,005 payload bytes, 20 times, to a Python listener on 127.0.0.1:5000.
+- **Evidence:** The listener received `b'EXFIL'` (the trimmed datagram). SilentSnake: `packets_seen 20`, `packets_undecoded 20`, `flows_started 0`, no event for port 5000. File replay of the same shape (`p9_udp_len_short_trailing`): `packets_undecoded 1`, no flow.
+- **Suggested fix:** Match the kernel: treat whole UDP datagrams as Malformed only when `ulen < 8` or `ulen > IP payload`; when `ulen < IP payload`, decode the first `ulen` bytes and flag an anomaly (for example `udp_trailing_bytes`) so the evasion attempt itself is visible. Builder decides.
+- **Status log:**
+  - 2026-11-25 open
+  - 2026-11-26 fix proposed (builder; needs adversary re-test): `decode()` drops a UDP length below 8 (also on cut packets) or, for whole packets, above the IP payload. A shorter length decodes the first `ulen` bytes (what the kernel delivers) and increments the new `udp_trailing_bytes` counter. Test `udp_length_shorter_than_ip_payload_is_trimmed_and_flagged` (IPv4 + IPv6, DNS learned from the trimmed payload); `whole_packets_with_lying_lengths_are_malformed` now covers `ulen + 7`, 7, 0, and 4 on a cut packet.
+  - 2026-11-26 fixed (re-test 5, report pentest-2026-11-25.md "Re-test 5"): I re-ran the original live attack (raw IPv4 via IP_HDRINCL, ulen 13, 3,005 payload bytes, ×20 to a listener on 127.0.0.1:5000). The listener got `b'EXFIL'` ×20, and SilentSnake shows the flow to :5000 with `udp_trailing_bytes 20` and `packets_undecoded 0`. The same over IPv6 to ::1:5001 also gives the flow and 20 trailing. Boundaries live, each checked against a listener and `/proc/net/snmp{,6}`: IPv4 ulen 0–7 and ulen > payload (kernel drops) are undecoded; ulen 8 and 9 (delivered) give a flow and are counted; ulen == payload is not counted; IPv6 ulen 7 / 8 / 13 / 14 / 0 all match the kernel (Linux 7.3 rejects ulen 0 on non-jumbo IPv6, and so does SilentSnake). File replay: `p9_udp_len_short_trailing` (IPv4, IPv6, DLT_RAW) gives 1 flow and 1 trailing. DNS: an answer inside `ulen` is learned; an answer only in the trailing bytes is not (parse error on the empty datagram the kernel delivers). Ethernet padding is not counted as trailing. ADV-0025 is not reopened. Residuals, filed separately: the cut-packet path compares against the captured length (ADV-0030), and bad UDP checksums are not considered (ADV-0031).
+
+### ADV-0030: Cut packets: the UDP length is checked against the captured bytes, not the IP header's length
+- **Severity:** low
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0029 fix)
+- **Found:** 2026-11-26 (report: pentest-2026-11-25.md, "Re-test 5")
+- **Violates:** docs/decisions/0001 ("matching what the host's own stack would accept"); docs/api/capture-events.md (`udp_trailing_bytes`); dependencies.json `threat_model` (integrity of what the analyst and risk scoring see).
+- **NIST SP 800-53:** SI-10, SI-4
+- **Reproduce:** `decode.rs`: when `cut` is true (captured < wire length), `ip_len` is the *captured* IP payload, so `ulen > ip_len` is allowed and `udp_trailing` is forced to false. But the IPv4 total length and the IPv6 payload length survive truncation, so the real IP payload length is still known. Live on lo (rootless container, NET_RAW, raw IPv4 via `IP_HDRINCL`; frames above the 18 KiB snaplen): (a) a 25,035-byte IPv4 datagram with UDP length 40,000 to a listener on 127.0.0.1:5201, ×5. (b) A 30,033-byte datagram with UDP length 13 to 127.0.0.1:5200, ×5. In `--read` files the same happens on ordinary-sized packets by forging the record's wire length (`u_gt_ip_cut`, `u_short_forged_wire`).
+- **Evidence:** (a) The listener got 0 datagrams (the kernel dropped them), yet SilentSnake: `flow_start` responder 127.0.0.1:5201, `flows_started 1`, `packets_undecoded 0`, so a phantom flow. (b) The listener got `b'EXFIL'` ×5; SilentSnake shows the flow but `udp_trailing_bytes 0`, so the evasion flag is bypassed. Files: `u_gt_ip_cut` gives 1 flow, `packets_undecoded 0`; `u_short_forged_wire` gives 1 flow, `udp_trailing_bytes 0`. Live, this needs a frame over 18 KiB, which in practice means a local sender with CAP_NET_RAW on loopback (or GSO/GRO super-packets); the 1,500-byte MTU stops a remote sender. Hence low.
+- **Suggested fix:** Take the IP payload length from the IP header (IPv4 `total_length - ihl*4`; IPv6 `payload_length` minus the parsed extension headers) whether or not the packet was cut. Then apply `ulen < 8 || ulen > ip_declared` → Malformed and `ulen < ip_declared` → `udp_trailing` on both paths. Keep lax handling only for the payload bytes the snaplen removed. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0031: UDP checksums are ignored: a DNS answer the kernel drops for a bad checksum is parsed and learned
+- **Severity:** low
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree
+- **Found:** 2026-11-26 (report: pentest-2026-11-25.md, "Re-test 5")
+- **Violates:** dependencies.json `threat_model` (integrity of labels the analyst trusts; see ADV-0005); docs/decisions/0001 ("matching what the host's own stack would accept").
+- **NIST SP 800-53:** SI-10, SI-4, SI-7
+- **Reproduce:** Raw IPv4/UDP on lo (IP_HDRINCL) from 127.0.0.1:53 to a listener on 127.0.0.1:5300: a valid DNS response (`bank-badck.example A 203.0.113.99`), with the UDP checksum set to a wrong non-zero value, ×3. Compare the listener, `/proc/net/snmp` and SilentSnake's output.
+- **Evidence:** Kernel: `InErrors +3, InCsumErrors +3`, and the listener got 0 datagrams. SilentSnake: `dns_messages 3`, `dns_parse_errors 0`, and `"answers":[{"name":"bank-badck.example","rtype":"A","ttl":3600,"data":"203.0.113.99"}]`. An on-path or LAN sender, with no privileges on this host, can feed SilentSnake's DNS cache (ADV-0005) with answers that the host itself never accepts. This leaves no trace in the host's resolver and makes poisoning stealthier. The same probably applies to TCP (for example an RST with a bad checksum feeding ADV-0003). TCP was not tested.
+- **Suggested fix:** Verify UDP (and TCP) checksums on **received** whole packets. Exclude outgoing packets: with TX checksum offload they are captured with a partial checksum, so a naive check would reject legitimate traffic. Use the SLL packet type / direction to tell them apart. On a mismatch, don't learn DNS names or SNI, and count `packets_bad_checksum` (or flag the flow). Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+
+### ADV-0032: TPACKET_V3 + no drain at stop: packets already in the ring are discarded unprocessed and not reported
+- **Severity:** medium
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0028 fix)
+- **Found:** 2026-11-26 (report: pentest-2026-11-25.md, "Re-test 5")
+- **Violates:** docs/controls.md "Capture completeness is visible" (AU-3/AU-5) and "Monitoring survives traffic bursts"; docs/api/capture-events.md (the summary warns when the record is incomplete); CLAUDE.md §5 item 2.
+- **NIST SP 800-53:** AU-5, AU-3, SI-4
+- **Reproduce:** `source.rs` `pump()` checks `--duration` (and `--count`) at the top of the loop and breaks without reading what is left in the capture ring. It then reads the kernel stats and writes `engine_stop`. With TPACKET_V3, the 32 MiB ring holds hundreds of thousands of small packets: everything that arrived while the engine was behind, plus the current block, which is not yet retired (up to `READ_TIMEOUT_MS` = 10 ms). The kernel counts these as received, not dropped, and they are never processed. Under V2 the same backlog overflowed the small ring and showed up as `kernel_dropped`. Release build, lo, NET_RAW-only container: `ld churn 20000 1` (20,000 new-flow datagrams in 1 s) while the consumer of stdout does not read for 6 s (as a busy log store would), with `--duration 4`.
+- **Evidence:**
+  ```
+  new (V3): kernel_received 79996  kernel_dropped 0      packets_seen 184  flows_started 184
+            summary: "Capture stopped because the requested duration elapsed: 184 packets seen, 184 flows recorded."
+  old (V2): kernel_received 79996  kernel_dropped 77815  packets_seen 184
+            summary: "... Warning: 77815 packets were dropped before SilentSnake saw them, so this record is incomplete."
+  ```
+  So 39,814 of 39,998 deliverable packets (99.5%) are missing, with zero drops reported and no warning. Smaller instances: a 1 kHz stream across the stop loses ~7–10 datagrams (V2: ~2–4); tight sustained load across the stop leaves 512 / 1,861 packets unprocessed; a ~1 MB/s reader under 20k/s churn leaves ~38k packets unreported on top of 359,712 reported drops. On lo, `kernel_received` is 2× `packets_seen` by design (libpcap discards the outgoing copy), so a consumer can't spot the gap from the counters either. Smoke check 1b asserts only `kernel_dropped == 0` and `kernel_received >= 240000`, so it passes this case. SIGTERM (ADV-0010) loses the backlog too.
+- **Suggested fix:** On stop, drain the ring before `flush()`: keep reading until `TimeoutExpired`, after at least one `READ_TIMEOUT_MS` (block retire) has passed, with a bounded deadline. Report anything left as a counter (for example `packets_unprocessed_at_stop`) that also triggers the "incomplete" warning. Extend smoke 1b to assert the burst was processed (on lo, `packets_seen == kernel_received / 2` with 0 drops). Apply the same drain path to the SIGTERM fix (ADV-0010). Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+  - 2026-11-26 fix proposed (builder; needs adversary re-test): `pump()` drains the ring after a `--duration` stop: it processes packets timestamped before the stop for up to 2 s (sleeping one block-retire interval, READ_TIMEOUT_MS + 5 ms, until two empty reads), then counts any remainder for up to 1 s as the new counter `packets_unprocessed_at_stop`, which the summary reports as an incomplete record. `--count` stops are not drained. Live, your stalled-consumer case (`--duration 4`, stdout unread 6 s, 20k churn): before `packets_seen 184`, no warning; after `packets_seen 40000` (all deliverable), `flows_started 39922`, `packets_unprocessed_at_stop 0`. Slow reader (~1 MB/s, 20k/s churn 6 s, `--duration 8`): `packets_seen 22438` + `packets_unprocessed_at_stop 43096` + `kernel_dropped 348932`/2 = 240,000 = every deliverable packet, and the summary says incomplete. Smoke 1b now also asserts `packets_seen >= kernel_received/2` and `packets_unprocessed_at_stop == 0`, and it fails (loudly) on the pre-drain build. Test `unprocessed_at_stop_marks_the_record_incomplete`.
+  - 2026-11-26 fixed (re-test 6, report pentest-2026-11-25.md "Re-test 6"): verified independently on a fresh build (sha256 `e686c4d4…56a9`). The stalled consumer (6 s, 20k churn, `--duration 4`) now gives `packets_seen 39998` of 39,998 deliverable (was 184, silent); 40k churn gives 79,998/79,998; `-i any` gives 40,006, all with 0 drops and 0 unprocessed. Slow reader (~1 MB/s, 20k/s × 6 s, `--duration 8`): 24,092 seen + 36,622 unprocessed + 358,568/2 dropped = 239,998 of 239,998, and the summary says incomplete, which confirms the builder's figures. A 1 kHz new-flow stream across the stop (3× lo, 3× any) has no holes, and the newest processed packet is within ±1 ms of the stop. Floods across the stop with a fast consumer extend shutdown by ≤ 0.64 s. `--count 1 / 100000 / 1000000` under a ~750k/s stream is exact. Smoke 1b gates it. Residual: the count can be wrong (still flagged as incomplete) when a stdout write blocks past both deadlines, or after a backwards clock step: new ADV-0033.
+
+### ADV-0033: `packets_unprocessed_at_stop` under-counts when the drain deadlines pass during a blocked write or after a clock step
+- **Severity:** low
+- **Milestone / commit:** capture stage A @ f414838 + uncommitted working tree (ADV-0032 fix)
+- **Found:** 2026-11-26 (report: pentest-2026-11-25.md, "Re-test 6")
+- **Violates:** docs/controls.md "Capture completeness is visible" (AU-3/AU-5); docs/api/capture-events.md (`packets_unprocessed_at_stop` semantics).
+- **NIST SP 800-53:** AU-5, AU-3
+- **Reproduce:** `source.rs` drain loop. (a) The deadlines (`process_until`, `skim_until`) are checked only after a packet is read, and `writer.write` blocks on a full stdout pipe. If a write blocks past both deadlines, the next packet is counted (`unprocessed = 1`), the loop ends because `now >= skim_until`, and the rest of the backlog is never counted. Live on lo: 20k churn datagrams in 1 s, `--duration 4`, with a consumer that reads one 64 KiB chunk every 5 s (a bursty log store). (b) Code review: `stop = Ts::now()` (wall clock) is compared with the kernel's wall-clock packet timestamps. A backwards clock step just before the stop makes the first backlog packet look newer than the stop, so the drain ends at once, with nothing processed, nothing counted and no warning. This was not run: it needs CAP_SYS_TIME and is a manual step for Ronin. (c) Shutdown is not bounded by the 3 s of budgets while the consumer stalls. An attacker can't stall the pipe, but can raise the event volume (ADV-0006).
+- **Evidence:** (a), 2 runs, both identical: `packets_seen 361`, `packets_unprocessed_at_stop 1`, `kernel_received 79996`, `kernel_dropped 0`, so 39,636 of 39,998 deliverable packets (99.1%) are neither processed nor counted. The summary still says "incomplete", because any non-zero count warns. Shutdown took 21 s past the duration. With one read every 2.5 s, the count was about right (50,835). Separately, `kernel_received` is read after the drain and includes packets that arrived after the stop: about 16,000 excess at ~550k datagrams/s, so the counters can't be reconciled exactly while traffic flows at the stop.
+- **Suggested fix:** Don't let a deadline turn into "stop counting". After the processing budget, keep skimming (reading and counting only, which is cheap) until the ring is empty or a packet is stamped after the stop, or emit an explicit `drain_complete: false` / lower-bound marker when the skim really has to stop. Keep the stop decision independent of wall-clock steps (for example, stop at the first post-stop packet only when `ts - stop` is small and positive, or snapshot `kernel_received` at the stop and count up to that). Take the kernel stats snapshot at the stop as well as after the drain. Consider a write deadline on the output. Builder decides.
+- **Status log:**
+  - 2026-11-26 open
+  - 2026-11-26 fix proposed (builder; needs adversary re-test): kernel stats snapshot at the stop; the skim window starts when skimming starts; stop boundary is `max(now, newest processed packet ts)`. Case (a) rerun: `packets_seen 361` + `packets_unprocessed_at_stop 39639` = 40,000 of 40,000 (was 361 + 1). Unbounded shutdown under a stalled consumer remains (ADV-0026 territory).

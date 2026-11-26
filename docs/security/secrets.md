@@ -8,7 +8,7 @@
 | Machine signing and encryption keys | Sealed: TPM 2.0, else kernel keyring / OS secret store with user passphrase (CLAUDE.md §3) | On disk unsealed, in the repo, readable by the LLM sandbox |
 | Local API token | Generated at first run, `$XDG_DATA_HOME/silentsnake/config/`, mode `0600` | In env vars, argv, logs, URLs or the repo |
 | Commercial LLM API key (off by default) | User's OS secret store, set by the user | In config files in the repo, logs, prompts |
-| Release signing (cosign) | CI secret store or keyless OIDC | In the repo or CI logs |
+| Release signing (cosign) | None stored: keyless OIDC in `.github/workflows/release.yml` (ADR-0002) | Any long-lived signing key, anywhere |
 | Dependency registry credentials | None expected: public dependencies need no credentials. If one is ever needed: user-level config, `0600` | In the repo, build scripts, CI logs |
 
 ## Rules

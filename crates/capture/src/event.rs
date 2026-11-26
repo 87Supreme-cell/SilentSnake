@@ -110,6 +110,11 @@ pub struct Counters {
     pub dns_parse_errors: u64,
     pub tls_client_hellos: u64,
     pub tls_unparsed: u64,
+    /// Whole UDP datagrams whose length field is shorter than the IP payload (ADV-0029).
+    pub udp_trailing_bytes: u64,
+    /// Packets captured before a `--duration` stop that the drain had no time left to process
+    /// (counted, not decoded). Non-zero means the record is incomplete (ADV-0032).
+    pub packets_unprocessed_at_stop: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
